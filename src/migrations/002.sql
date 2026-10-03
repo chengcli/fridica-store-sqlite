@@ -1,0 +1,1 @@
+ALTER TABLE thread_inbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;

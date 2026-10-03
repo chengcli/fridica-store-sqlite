@@ -1,0 +1,32 @@
+[package]
+name = "fridica-store-sqlite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Fridica's state on SQLite: the store thread, schema and migrations, weekly archives and the replay ledger"
+license = "MIT"
+repository = "https://github.com/chengcli/fridica-store-sqlite"
+readme = "README.md"
+keywords = ["agent", "slack", "sqlite", "storage"]
+categories = ["database", "development-tools"]
+
+[features]
+# Fault-injection entry points of the migration engine, for hosts' tests.
+testing = []
+
+[dependencies]
+fridica-core = "0.2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
+regex = "1"
+rusqlite = { version = "0.38", features = ["bundled", "backup", "serde_json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
