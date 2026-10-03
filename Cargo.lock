@@ -161,7 +161,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "fridica-core"
 version = "0.2.0"
-source = "git+https://github.com/chengcli/fridica-core?rev=eb291da0af5d7f5fd90103f8d0cdd9945941c13d#eb291da0af5d7f5fd90103f8d0cdd9945941c13d"
+source = "git+https://github.com/chengcli/fridica-core?rev=abbd171bd0aa9c15eba643b5f6ac1c2ab30b7e73#abbd171bd0aa9c15eba643b5f6ac1c2ab30b7e73"
 dependencies = [
  "anyhow",
  "regex",
