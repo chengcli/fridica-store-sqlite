@@ -161,8 +161,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "fridica-core"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f55789bb3e88f56327800a2ae3eedc1fd04f2068221dc66b034bc354e44346b7"
+source = "git+https://github.com/chengcli/fridica-core?rev=e276725733561f0f37c1a35570d643fecf837126#e276725733561f0f37c1a35570d643fecf837126"
 dependencies = [
  "anyhow",
  "regex",

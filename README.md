@@ -15,6 +15,10 @@ same traits and pass the same conformance suite.
 - `Store` (the crate root): one dedicated thread owns the connection (WAL, foreign
   keys, a 5 s busy timeout); callers run closures on it with `Store::call`. The file
   is private (0600) and locked against a second daemon.
+- The storage contract: `Store` implements `fridica_core::store::Store`, and a unit
+  of work is one transaction; `Sqlite` implements the area traits (so far the
+  ledger and health events) over a connection, which is also how a host reaches
+  them from inside its own queries until they all move here.
 - `schema` and `migrations/*.sql`: the schema versions (`schema::VERSION`), applied in
   order, and the guards that count every durable write so an automatic rollback is
   refused once the daemon has written.

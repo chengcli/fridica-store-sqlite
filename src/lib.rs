@@ -12,8 +12,11 @@ pub mod migration;
 pub mod outbox;
 pub mod record;
 pub mod schema;
+mod unit;
 pub mod work;
 pub mod worker_controls;
+
+pub use unit::Sqlite;
 
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;

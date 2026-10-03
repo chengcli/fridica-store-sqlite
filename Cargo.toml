@@ -30,3 +30,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The storage contract (fridica#117) until the next fridica-core release.
+[patch.crates-io]
+fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "e276725733561f0f37c1a35570d643fecf837126" }
