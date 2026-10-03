@@ -121,3 +121,119 @@ async fn health_events_are_deduplicated_by_time_or_by_detail() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn views_read_threads_messages_and_files() {
+    use fridica_core::store::{Cell, Row};
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,control,created,updated) VALUES
+                    ('T:C:1','T','C','1','active',1,5),('T:C:2','T','C','2','paused',1,7.5);
+                 INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at,attachments_json) VALUES
+                    ('e1','T','C','1','1','U','one','slack',1,'[{\"id\":\"F1\"}]'),
+                    ('e2','T','C','2.5','1','U','two','slack',2,'[]'),
+                    ('e3','T','C','10','1','U','three','slack',3,'[{\"id\":\"F12\"}]');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (all, paused, attention, one, missing, messages, status) = store
+        .transact(|u| {
+            Ok((
+                u.threads(&[], 10)?,
+                u.threads(&["paused".into()], 10)?,
+                u.threads_needing_attention()?,
+                u.thread("T:C:1")?,
+                u.thread("T:C:9")?,
+                u.thread_messages("T:C:1", 2)?,
+                u.status()?,
+            ))
+        })
+        .await
+        .unwrap();
+    let id = |row: &Row| row.0[0].1.clone();
+    assert_eq!(
+        all.iter().map(id).collect::<Vec<_>>(),
+        [Cell::Text("T:C:2".into()), Cell::Text("T:C:1".into())]
+    );
+    assert_eq!(paused.len(), 1);
+    assert_eq!(attention, paused);
+    // Columns keep their names, order and stored types; JSON stays text.
+    let one = one.unwrap();
+    assert_eq!(one.0[0].0, "id");
+    let column = |row: &Row, name: &str| row.0.iter().find(|(n, _)| n == name).unwrap().1.clone();
+    assert_eq!(column(&one, "turns"), Cell::Integer(0));
+    assert_eq!(column(&one, "updated"), Cell::Real(5.0));
+    assert_eq!(column(&one, "decisions_json"), Cell::Text("[]".into()));
+    assert_eq!(column(&one, "control_detail_json"), Cell::Text("{}".into()));
+    assert_eq!(missing, None);
+    // The last messages, oldest first.
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| column(m, "text"))
+            .collect::<Vec<_>>(),
+        [Cell::Text("two".into()), Cell::Text("three".into())]
+    );
+    assert_eq!(column(&messages[0], "meta_json"), Cell::Null);
+    assert_eq!(status.runtime, None);
+    assert_eq!(status.pending_approvals, 0);
+    let (files, unknown, mentioning, latest, exists, approval) = store
+        .transact(|u| {
+            Ok((
+                u.thread_files("T:C:1")?,
+                u.thread_files("T:C:9")?,
+                u.attachments_mentioning("F1")?,
+                u.latest_thread_in("T", "C")?,
+                (u.thread_exists("T:C:1")?, u.thread_exists("T:C:9")?),
+                u.approval_exists("A1")?,
+            ))
+        })
+        .await
+        .unwrap();
+    let files = files.unwrap();
+    assert_eq!(
+        files.iter().map(|f| f.ts.as_str()).collect::<Vec<_>>(),
+        ["1", "2.5", "10"]
+    );
+    assert_eq!(files[0].attachments, r#"[{"id":"F1"}]"#);
+    assert_eq!(unknown, None);
+    // Only the exact file ID, not one it prefixes.
+    assert_eq!(mentioning, [r#"[{"id":"F1"}]"#]);
+    assert_eq!(latest.as_deref(), Some("T:C:2"));
+    assert_eq!(exists, (true, false));
+    assert!(!approval);
+}
+
+#[tokio::test]
+async fn owner_notes_are_revised_and_audited() {
+    let (_dir, store) = store().await;
+    let revisions = store
+        .transact(|u| {
+            let before = u.notes_revision("T:C:1")?;
+            u.write_owner_notes("T:C:1", before + 1, "U1", r#"{"b":1,"a":2}"#, 3.0)?;
+            Ok((before, u.notes_revision("T:C:1")?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(revisions, (0, 1));
+    let (notes, activity) = store
+        .transact(|u| Ok((u.thread_notes("T:C:1")?, u.activity(10)?)))
+        .await
+        .unwrap();
+    let notes = serde_json::to_string(&notes.unwrap()).unwrap();
+    assert!(notes.contains(r#"{\"b\":1,\"a\":2}"#), "{notes}");
+    let activity = serde_json::to_string(&activity).unwrap();
+    assert!(
+        activity.contains("notes.write") && activity.contains(r#"{\"revision\":1}"#),
+        "{activity}"
+    );
+    // A revision is written once.
+    assert!(store
+        .transact(|u| u.write_owner_notes("T:C:1", 1, "U1", "{}", 4.0))
+        .await
+        .is_err());
+}
