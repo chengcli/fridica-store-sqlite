@@ -1,6 +1,6 @@
 //! The storage contract (`fridica_core::store`) as fridica-store-sqlite keeps it.
 //! Stage 3 of fridica#117 turns these into a suite any backend can run.
-use fridica_core::store::{transact, Store as _};
+use fridica_core::store::{transact, ChannelActivity, Report, Store as _};
 use fridica_store_sqlite::Store;
 
 async fn store() -> (tempfile::TempDir, Store) {
@@ -120,4 +120,97 @@ async fn health_events_are_deduplicated_by_time_or_by_detail() {
         .transact(|u| u.note_unless_noted("x", "{}", 1.0, &["a'b"]))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn an_empty_window_counts_no_activity() {
+    let (_dir, store) = store().await;
+    let (activity, campaign) = store
+        .transact(|u| {
+            Ok((
+                u.channel_activity("C", 0.0, 9.0)?,
+                u.campaign_items_updated(0.0, 9.0)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(activity, ChannelActivity::default());
+    assert_eq!(campaign, 0);
+}
+
+fn report(day: &str, markdown: &str, created: f64) -> Report {
+    Report {
+        channel: "C".into(),
+        day: day.into(),
+        timezone: "UTC".into(),
+        data: r#"{"b":1,"a":2}"#.into(),
+        markdown: markdown.into(),
+        created,
+    }
+}
+
+#[tokio::test]
+async fn a_kept_report_is_exported_once_per_generation() {
+    let (_dir, store) = store().await;
+    let pending = store
+        .transact(|u| {
+            u.keep_report(&report("2026-09-27", "second day", 1.0))?;
+            u.keep_report(&report("2026-09-26", "old", 1.0))?;
+            u.keep_report(&report("2026-09-26", "first day", 2.0))?;
+            u.pending_exports()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|e| (e.day.as_str(), e.markdown.as_str()))
+            .collect::<Vec<_>>(),
+        [("2026-09-26", "first day"), ("2026-09-27", "second day")]
+    );
+    let first = pending[0].generation;
+    assert!(first > pending[1].generation);
+    let marked = store
+        .transact(move |u| {
+            assert_eq!(u.pending_export("C", "2026-09-26")?, Some(first));
+            Ok((
+                u.mark_exported("C", "2026-09-26", first - 1)?,
+                u.mark_exported("C", "2026-09-26", first)?,
+                u.pending_export("C", "2026-09-26")?,
+                u.pending_export("C", "2026-01-01")?,
+                u.pending_exports()?.len(),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(marked, (0, 1, None, None, 1));
+    // Keeping it again queues a new generation.
+    let again = store
+        .transact(|u| {
+            u.keep_report(&report("2026-09-26", "again", 3.0))?;
+            u.pending_export("C", "2026-09-26")
+        })
+        .await
+        .unwrap();
+    assert_eq!(again, Some(first + 1));
+}
+
+#[tokio::test]
+async fn a_report_is_queued_for_posting_once() {
+    let (_dir, store) = store().await;
+    assert!(store
+        .transact(|u| u.queue_report_post("C", "2026-09-26", "daily:C:2026-09-26", "S", 1.0))
+        .await
+        .is_err());
+    let queued = store
+        .transact(|u| {
+            u.keep_report(&report("2026-09-26", "day", 1.0))?;
+            Ok([
+                u.queue_report_post("C", "2026-09-26", "daily:C:2026-09-26", "S", 1.0)?,
+                u.queue_report_post("C", "2026-09-26", "daily:C:2026-09-26", "S", 2.0)?,
+            ])
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued, [true, false]);
 }
