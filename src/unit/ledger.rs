@@ -1,24 +1,8 @@
-//! The storage contract (`fridica_core::store`) on SQLite: a unit of work is
-//! one transaction on the store thread.
-use crate::Store;
+//! The replay ledger and health events.
+use super::Sqlite;
 use anyhow::Result;
-use fridica_core::store::{self, Event, Health, Ledger, Pending, Work};
-use rusqlite::{params, Connection};
-
-/// The area traits over one connection or transaction. While Fridica still
-/// runs its own queries, it wraps a transaction in this to reach the traits.
-pub struct Sqlite<'a>(pub &'a Connection);
-
-impl store::Store for Store {
-    fn run(&self, work: Work) -> Pending<'_> {
-        Box::pin(self.call(move |c| {
-            let tx = c.transaction()?;
-            let result = work(&mut Sqlite(&tx))?;
-            tx.commit()?;
-            Ok(result)
-        }))
-    }
-}
+use fridica_core::store::{Event, Health, Ledger};
+use rusqlite::params;
 
 impl Ledger for Sqlite<'_> {
     fn record(&mut self, kind: &str, time: f64, payload: &str, complete: bool) -> Result<i64> {
