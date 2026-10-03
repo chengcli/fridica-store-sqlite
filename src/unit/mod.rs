@@ -4,6 +4,7 @@ use crate::Store;
 use fridica_core::store::{self, Pending, Work};
 use rusqlite::Connection;
 
+mod events;
 mod ledger;
 
 /// The area traits over one connection or transaction. While Fridica still
