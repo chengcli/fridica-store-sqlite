@@ -33,4 +33,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # The storage contract (fridica#117) until the next fridica-core release.
 [patch.crates-io]
-fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "5baf4d6f87f739db6a4fd8c5cdc1e6fc12904e75" }
+fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "3169c9a46fea259099bc9715e8de002324aa4de7" }
