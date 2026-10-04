@@ -42,8 +42,3 @@ fridica-core = { version = "0.4", features = ["conformance"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-
-# fridica#128 is in progress: build against the sibling checkout until
-# fridica-core 0.4 is published.
-[patch.crates-io]
-fridica-core = { path = "../fridica-core" }
