@@ -1,6 +1,6 @@
 [package]
 name = "fridica-store-sqlite"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Fridica's state on SQLite: the store thread, schema and migrations, weekly archives and the replay ledger"
@@ -15,7 +15,7 @@ categories = ["database", "development-tools"]
 testing = []
 
 [dependencies]
-fridica-core = "0.4"
+fridica-core = "0.5"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
@@ -38,7 +38,10 @@ required-features = ["testing"]
 
 [dev-dependencies]
 # The storage contract's conformance suite (tests/conformance.rs).
-fridica-core = { version = "0.4", features = ["conformance"] }
+fridica-core = { version = "0.5", features = ["conformance"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
+# fridica-core 0.5 (worker roles, stance; fridica#131) until it is published.
+[patch.crates-io]
+fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "aa309dde901990c4c9fc33aac71f6f4c2531ebf8" }
