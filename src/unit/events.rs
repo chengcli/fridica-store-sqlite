@@ -51,6 +51,9 @@ impl LedgerLookups for Sqlite<'_> {
         )?
         .query_row(params![seq, time, event_id], |r| r.get::<_, bool>(0))?)
     }
+    fn backfill_record(&mut self, client_id: &str) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT payload_json FROM replay_events WHERE kind='obligations_backfill' AND json_extract(payload_json,'$.request.client_id')=?",[client_id],|r|r.get(0)).optional()?)
+    }
 }
 
 impl FeedLookups for Sqlite<'_> {
