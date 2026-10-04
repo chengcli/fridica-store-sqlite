@@ -2,8 +2,8 @@
 use super::Sqlite;
 use anyhow::Result;
 use fridica_core::store::{
-    Arrival, Fence, Jobs, NewAsk, ObligationChange, ParentTurn, QueuedHandoff, Sessions,
-    Settlement, TriageSettlement, TurnClose, TurnFailure, TurnInput, TurnObligations, TurnRetry,
+    Arrival, Fence, NewAsk, ObligationChange, ParentTurn, QueuedHandoff, Sessions, Settlement,
+    TriageSettlement, TurnClose, TurnFailure, TurnInput, TurnJobs, TurnObligations, TurnRetry,
     Turns,
 };
 use rusqlite::params;
@@ -348,7 +348,7 @@ impl Sessions for Sqlite<'_> {
     }
 }
 
-impl Jobs for Sqlite<'_> {
+impl TurnJobs for Sqlite<'_> {
     fn mark_reported(&mut self, session: &str, jobs: &[Option<String>]) -> Result<()> {
         let mut update = self
             .0

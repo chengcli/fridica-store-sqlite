@@ -10,6 +10,7 @@ mod controls;
 mod events;
 mod ingest;
 mod ledger;
+mod modules;
 mod neighbours;
 mod views;
 
