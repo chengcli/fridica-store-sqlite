@@ -1,7 +1,10 @@
 //! One bounded queue and one dedicated SQLite thread; callers never share a connection.
-/// The SQLite binding the store's API exposes, until every query is behind
-/// the storage traits (#117 stage 2).
-pub use rusqlite;
+//!
+//! Hosts reach the data through the storage contract (`fridica_core::store`):
+//! [`Store`] implements its `Store`, and a unit of work is one transaction.
+//! `Store::call`, which runs a closure on the raw connection, is for tests
+//! only: it is public with the `testing` feature, so a host's tests can
+//! inspect a database with SQL, and private to the crate otherwise.
 pub mod approvals;
 pub mod archive;
 pub mod configuration;
@@ -147,7 +150,38 @@ impl Store {
         Ok(())
     }
 
+    /// Run `function` on the store thread's connection. For tests: hosts use
+    /// the storage contract (`fridica_core::store::Store::transact`).
+    #[cfg(feature = "testing")]
     pub async fn call<T, F>(&self, function: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        self.dispatch(function).await
+    }
+    /// Run `function` on the store thread's connection.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) async fn call<T, F>(&self, function: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        self.dispatch(function).await
+    }
+    /// One round of moving quiet threads and old events to the weekly
+    /// archives ([`archive::round`]) beside the database at `db`.
+    pub async fn archive_round(
+        &self,
+        db: PathBuf,
+        now: f64,
+        limits: archive::Limits,
+    ) -> Result<archive::Round> {
+        self.call(move |c| archive::round(c, &db, now, limits))
+            .await
+    }
+
+    async fn dispatch<T, F>(&self, function: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
@@ -171,4 +205,17 @@ impl Store {
             .map_err(|_| anyhow!("database thread stopped"))?;
         wait.await.context("database request cancelled")?
     }
+}
+
+/// Whether `error` came from the database itself (not from the caller's
+/// checks), for hosts that report storage failures apart.
+pub fn storage_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<rusqlite::Error>().is_some()
+}
+
+/// Whether `error` is a lookup of a record that does not exist.
+pub fn not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|e| matches!(e, rusqlite::Error::QueryReturnedNoRows))
 }

@@ -25,8 +25,10 @@ cargo test --test conformance --test contract
 ## Modules
 
 - `Store` (the crate root): one dedicated thread owns the connection (WAL, foreign
-  keys, a 5 s busy timeout); callers run closures on it with `Store::call`. The file
-  is private (0600) and locked against a second daemon.
+  keys, a 5 s busy timeout). The file is private (0600) and locked against a second
+  daemon. `Store::call`, which runs a closure on the raw connection, is for tests: it
+  is public only with the `testing` feature, so a host's tests can inspect a database
+  with SQL.
 - The storage contract: `Store` implements `fridica_core::store::Store`, and a unit
   of work is one transaction; `Sqlite` implements every area trait over a connection,
   which is also how a host reaches them from inside its own queries until they all
@@ -66,13 +68,10 @@ cargo test --test conformance --test contract
   `configuration`: the stores for posts, workers and jobs, approvals, scoped fetches,
   worker controls, diagnostics and configuration-edit intents.
 
-`rusqlite` is re-exported for hosts whose own queries have not moved behind the traits
-yet.
-
 ## Features
 
-- `testing`: the migration engine's fault-injection entry points
-  (`migrate_with_checkpoint`, `rollback_with_checkpoint`), for hosts' tests.
+- `testing`: for hosts' tests: `Store::call`, and the migration engine's
+  fault-injection entry points (`migrate_with_checkpoint`, `rollback_with_checkpoint`).
 
 ## License
 
