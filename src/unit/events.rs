@@ -3,7 +3,7 @@
 use super::Sqlite;
 use anyhow::Result;
 use fridica_core::store::{
-    FeedLookups, GithubPause, LedgerLookups, OutboxPost, RecordedNames, SlackNames,
+    FeedLookups, GithubPause, LedgerLookups, OutboxPost, RecordedNames, SlackIdentity, SlackNames,
 };
 use rusqlite::{params, OptionalExtension};
 
@@ -34,6 +34,13 @@ impl SlackNames for Sqlite<'_> {
         )?;
         Ok(())
     }
+    fn keep_identity(&mut self, identity: &SlackIdentity) -> Result<()> {
+        let c = self.0;
+        c.execute("INSERT INTO meta VALUES('slack_scopes',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[&identity.scopes])?;
+        c.execute("INSERT INTO meta VALUES('slack_channel_names',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[&identity.channels])?;
+        c.execute("INSERT INTO meta VALUES('slack_workspace_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[&identity.workspace])?;
+        Ok(())
+    }
 }
 
 impl LedgerLookups for Sqlite<'_> {
@@ -50,6 +57,9 @@ impl LedgerLookups for Sqlite<'_> {
             "SELECT EXISTS(SELECT 1 FROM replay_events WHERE kind='intake' AND seq<?1 AND seq>=?1-1000 AND time=?2 AND json_extract(payload_json,'$.message.event_id')=?3)",
         )?
         .query_row(params![seq, time, event_id], |r| r.get::<_, bool>(0))?)
+    }
+    fn attachment_context(&mut self, key: &str) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT json_extract(payload_json,'$.context') FROM replay_events WHERE kind='parent_attachment_result' AND complete=1 AND json_extract(payload_json,'$.key')=? ORDER BY seq DESC LIMIT 1",[key],|r|r.get::<_,String>(0)).optional()?)
     }
 }
 

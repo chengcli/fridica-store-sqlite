@@ -5,6 +5,7 @@ use fridica_core::store::{self, Pending, Work};
 use rusqlite::Connection;
 
 mod events;
+mod ingest;
 mod ledger;
 mod report;
 mod views;

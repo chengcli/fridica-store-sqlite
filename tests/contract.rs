@@ -443,3 +443,257 @@ async fn a_github_pause_keeps_the_later_end() {
         .unwrap();
     assert_eq!(until, (None, Some("20.5".to_string())));
 }
+
+#[tokio::test]
+async fn slack_identity_is_kept_as_reported() {
+    let (_dir, store) = store().await;
+    let names = store
+        .transact(|u| {
+            u.keep_identity(&fridica_core::store::SlackIdentity {
+                scopes: "old".into(),
+                channels: "{}".into(),
+                workspace: "old".into(),
+            })?;
+            u.keep_identity(&fridica_core::store::SlackIdentity {
+                scopes: "chat:write,files:read".into(),
+                channels: r#"{"C1":"room"}"#.into(),
+                workspace: "scix".into(),
+            })?;
+            u.slack_names()
+        })
+        .await
+        .unwrap();
+    assert_eq!(names.workspace.as_deref(), Some("scix"));
+    assert_eq!(names.channels.as_deref(), Some(r#"{"C1":"room"}"#));
+    let scopes: String = store
+        .call(|c| {
+            Ok(
+                c.query_row("SELECT value FROM meta WHERE key='slack_scopes'", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(scopes, "chat:write,files:read");
+}
+
+#[tokio::test]
+async fn catch_up_keeps_watermarks_and_truncated_passes() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute("INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at) VALUES('e1','T','C','10.5','10.5','U','a','socket',11.0),('e2','T','C','20.5','10.5','U','b','socket',21.0),('e3','T','D','30.5','30.5','U','c','socket',31.0)", [])?;
+            c.execute("INSERT INTO threads(id,workspace,channel,root_ts,created,updated) VALUES('T:C:1','T','C','1',1.0,5.0),('T:C:2','T','C','2',1.0,50.0),('T:D:3','T','D','3',1.0,60.0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (before, latest, earlier, none, roots, runs) = store
+        .transact(|u| {
+            Ok((
+                u.catchup_mark("T", "C")?,
+                u.latest_message_ts("T", "C", None)?,
+                u.latest_message_ts("T", "C", Some(21.0))?,
+                u.latest_message_ts("T", "E", None)?,
+                u.recent_thread_roots("T", "C", 10.0)?,
+                u.truncated_passes("T", "C")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (before, latest, earlier, none),
+        (None, Some(20.5), Some(10.5), None)
+    );
+    assert_eq!(roots, ["2"]);
+    assert_eq!(runs, None);
+    let (mark, runs) = store
+        .transact(|u| {
+            u.keep_watermark(&fridica_core::store::Watermark {
+                workspace: "T".into(),
+                channel: "C".into(),
+                mark: 7.25,
+                pinned: true,
+                truncated_passes: 1,
+            })?;
+            Ok((u.catchup_mark("T", "C")?, u.truncated_passes("T", "C")?))
+        })
+        .await
+        .unwrap();
+    assert_eq!((mark, runs.as_deref()), (Some(7.25), Some("1")));
+    let stored: (String, bool) = store
+        .call(|c| {
+            Ok((
+                c.query_row("SELECT value FROM meta WHERE key='catchup:T:C'", [], |r| {
+                    r.get(0)
+                })?,
+                c.query_row(
+                    "SELECT pinned FROM channel_watermarks WHERE workspace='T' AND channel='C'",
+                    [],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, ("7.250000".into(), true));
+}
+
+#[tokio::test]
+async fn the_socket_status_is_kept_in_meta_and_the_runtime_row() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute("INSERT INTO runtime(id,pid,started_at,heartbeat_at,slack_status,observe_only) VALUES(1,1,1.0,1.0,'',0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let status = store
+        .transact(|u| {
+            let before = u.socket_status()?;
+            u.keep_socket_status("connected")?;
+            Ok((before, u.socket_status()?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, (None, Some("connected".into())));
+    let runtime: String = store
+        .call(|c| {
+            Ok(
+                c.query_row("SELECT slack_status FROM runtime WHERE id=1", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(runtime, "connected");
+}
+
+#[tokio::test]
+async fn file_lookups_find_own_uploads_and_thread_attachments() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute("INSERT INTO outbox(idem_key,session_id,kind,channel,thread_ts,filename,sent_ts,created) VALUES('a','T:C:1.0','upload','C','1.0','plot.png','F1',1.0),('b','T:C:1.0','upload','C','1.0','table.csv','',1.0),('c','T:C:1.0','reply','C','1.0','other.txt','',1.0)", [])?;
+            c.execute("INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at,attachments_json) VALUES('e1','T','C','1.0','1.0','U','a','socket',1.0,'[{\"id\":\"F9\"}]'),('e2','T','C','2.0','2.0','U','b','socket',2.0,'[]')", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (own, files, none) = store
+        .transact(|u| {
+            let files = [
+                ("F1", "anything"),
+                ("F2", "table.csv"),
+                ("F3", "other.txt"),
+                ("F4", "plot.png"),
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()));
+            Ok((
+                u.own_uploads("C", "1.0", &files)?,
+                u.session_attachments("T:C:1.0")?,
+                u.session_attachments("T:C:9.0")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(own, ["F1", "F2"]);
+    assert_eq!(files, [r#"[{"id":"F9"}]"#]);
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn the_ledger_finds_the_latest_attachment_context() {
+    let (_dir, store) = store().await;
+    let found = store
+        .transact(|u| {
+            u.record(
+                "parent_attachment_result",
+                1.0,
+                r#"{"key":"k","context":{"n":1}}"#,
+                true,
+            )?;
+            u.record(
+                "parent_attachment_result",
+                2.0,
+                r#"{"key":"k","context":{"n":2}}"#,
+                true,
+            )?;
+            u.record(
+                "parent_attachment_result",
+                3.0,
+                r#"{"key":"k","context":{"n":3}}"#,
+                false,
+            )?;
+            u.record(
+                "parent_attachment_result",
+                4.0,
+                r#"{"key":"j","context":{"n":4}}"#,
+                true,
+            )?;
+            Ok((u.attachment_context("k")?, u.attachment_context("x")?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(found, (Some(r#"{"n":2}"#.to_string()), None));
+}
+
+#[tokio::test]
+async fn the_supervisor_interrupts_and_fingerprints_workers() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute("INSERT INTO threads(id,workspace,channel,root_ts,created,updated) VALUES('T:C:1','T','C','1',1.0,1.0)", [])?;
+            c.execute("INSERT INTO workers(id,session_id,machine,workspace,backend,backend_session_id,created,updated) VALUES('w1','T:C:1','m','/w','claude','s1',1.0,1.0)", [])?;
+            c.execute("INSERT INTO approvals(id,worker_id,job_id,session_id,kind,summary,created) VALUES('a1','w1','j1','T:C:1','tool','x',1.0),('a2','w2','j2','T:C:1','tool','y',1.0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let fingerprints = store
+        .transact(|u| {
+            u.interrupt_worker("w1", 9.0)?;
+            let before = u.instructions_fingerprint("w1")?;
+            u.begin_instructions("w1", "f1", false)?;
+            let kept = u.instructions_fingerprint("w1")?;
+            u.begin_instructions("w1", "f2", true)?;
+            Ok((before, kept, u.instructions_fingerprint("w1")?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(fingerprints, (None, Some("f1".into()), Some("f2".into())));
+    let rows = store
+        .call(|c| {
+            let approvals = c
+                .prepare("SELECT id,status,decided_by,decided_at FROM approvals ORDER BY id")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<(String, String, String, f64)>>>()?;
+            let audit: (String, String, String) =
+                c.query_row("SELECT actor,action,target FROM audit", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+            let session: String = c.query_row(
+                "SELECT backend_session_id FROM workers WHERE id='w1'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((approvals, audit, session))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.0,
+        [
+            ("a1".into(), "cancelled".into(), "system".into(), 9.0),
+            ("a2".into(), "pending".into(), String::new(), 0.0)
+        ]
+    );
+    assert_eq!(
+        rows.1,
+        ("owner".into(), "worker.interrupt".into(), "w1".into())
+    );
+    assert_eq!(rows.2, "");
+}
