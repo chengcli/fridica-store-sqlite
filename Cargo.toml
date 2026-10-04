@@ -44,4 +44,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # fridica-core 0.5 (worker roles, stance; fridica#131) until it is published.
 [patch.crates-io]
-fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "aa309dde901990c4c9fc33aac71f6f4c2531ebf8" }
+fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "b60a236425630c2efa36480812f8606c1e18660e" }
