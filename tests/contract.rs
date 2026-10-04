@@ -1166,3 +1166,653 @@ async fn linked_threads_are_read_with_their_state() {
         .unwrap();
     assert_eq!(limited.len(), 1);
 }
+
+/// A thread `T:C:1` with worker `w1` on machine `m`, and job `j1` queued on it.
+async fn thread_with_job(store: &Store) {
+    store
+        .call(|c| {
+            c.execute("INSERT INTO threads(id,workspace,channel,root_ts,created,updated) VALUES('T:C:1','T','C','1',1.0,1.0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .transact(|u| {
+            u.add_workers(
+                &serde_json::from_value::<Vec<_>>(serde_json::json!([{
+                    "id":"w1","session_id":"T:C:1","machine":"m","workspace":"/w","backend":"claude"
+                }]))?,
+                1.0,
+            )?;
+            u.queue_jobs(
+                &serde_json::from_value::<Vec<_>>(serde_json::json!([{
+                    "id":"j1","worker_id":"w1","session_id":"T:C:1","brief":"look",
+                    "fetch_repo":"r","fetch_ref":"main"
+                }]))?,
+                2.0,
+            )
+        })
+        .await
+        .unwrap();
+}
+
+fn machines() -> fridica_core::config::registry::Registry {
+    serde_json::from_value(serde_json::json!({"default":"m","machines":[{
+        "name":"m","transport":"local","workspaces":[],"backends":["claude"],
+        "default_backend":"claude","policy":{},"host":"","tags":[],"resources":{},
+        "max_workers":2,"max_jobs":2,"slurm":null,"description":""}]}))
+    .unwrap()
+}
+
+/// Claim `j1` in slot 1.
+async fn claim_j1(store: &Store) -> fridica_core::store::ClaimedJob {
+    let machines = machines();
+    store
+        .transact(move |u| {
+            u.claim_job(
+                "j1",
+                1,
+                &machines,
+                &fridica_core::config::Limits::default(),
+                3.0,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+fn post(key: &str, text: &str, after: &str) -> fridica_core::delivery::Post {
+    fridica_core::delivery::Post {
+        idem_key: key.into(),
+        session_id: "T:C:1".into(),
+        kind: "reply".into(),
+        channel: "C".into(),
+        thread_ts: Some("1".into()),
+        text: text.into(),
+        meta: None,
+        filename: String::new(),
+        blob: None,
+        after: after.into(),
+    }
+}
+
+#[tokio::test]
+async fn the_outbox_queues_once_and_fences_delivery_attempts() {
+    use fridica_core::{delivery::DeliveryOutcome, store::PostOutcome, Authority};
+    let (_dir, store) = store().await;
+    let (first, again, conflict, ready) = store
+        .transact(|u| {
+            let first = u.queue_post(&post("k1", "hi", ""), 1.0)?;
+            let again = u.queue_post(&post("k1", "hi", ""), 1.0)?;
+            let conflict = u
+                .queue_post(&post("k1", "changed", ""), 1.0)
+                .unwrap_err()
+                .to_string();
+            u.queue_post(&post("k2", "next", "k1"), 1.0)?;
+            Ok((first, again, conflict, u.ready_posts(2.0, 10)?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, again);
+    assert_eq!(
+        conflict,
+        "outbox idempotency key reused with different content"
+    );
+    // The second post waits for the first.
+    assert_eq!(ready, [first]);
+    let claim = store
+        .transact(|u| u.claim_post(2.0, None))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((claim.id, claim.attempt), (first, 1));
+    // A late result of another attempt is recorded, and reported as stale.
+    let mut late = claim.clone();
+    late.attempt = 9;
+    let sent = DeliveryOutcome::Sent {
+        reference: "5.000001".into(),
+    };
+    let (stale, done) = store
+        .transact(move |u| {
+            let stale = u.finish_delivery(&late, &sent, "U1", 3.0)?;
+            Ok((stale, u.finish_delivery(&claim, &sent, "U1", 3.0)?))
+        })
+        .await
+        .unwrap();
+    assert_eq!((stale, done), (PostOutcome::Stale, PostOutcome::Sent));
+    let (second, refused) = store
+        .transact(|u| {
+            let second = u.claim_post(4.0, None)?.unwrap();
+            let refused = u.finish_delivery(
+                &second,
+                &DeliveryOutcome::Rejected {
+                    code: "nope".into(),
+                },
+                "U1",
+                4.0,
+            )?;
+            Ok((second, refused))
+        })
+        .await
+        .unwrap();
+    assert_eq!(refused, PostOutcome::Unsent);
+    let (by_other, retried, recovered) = store
+        .transact(move |u| {
+            let by_other = u.retry_post(second.id, Authority::System, 5.0).is_err();
+            let retried = u.retry_post(second.id, Authority::Owner, 5.0)?;
+            u.claim_post(6.0, Some(second.id))?.unwrap();
+            Ok((by_other, retried, u.recover_posts(7.0)?))
+        })
+        .await
+        .unwrap();
+    assert!(by_other && retried);
+    assert_eq!(recovered, 1);
+    let rows = store
+        .call(|c| {
+            let states = c
+                .prepare("SELECT state,error FROM outbox ORDER BY id")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+            let kinds = c
+                .prepare("SELECT kind FROM replay_events ORDER BY seq")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            let echo: String =
+                c.query_row("SELECT source FROM messages WHERE ts='5.000001'", [], |r| {
+                    r.get(0)
+                })?;
+            Ok((states, kinds, echo))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.0,
+        [
+            ("sent".into(), String::new()),
+            ("ambiguous".into(), "daemon_stopped_during_send".into())
+        ]
+    );
+    assert_eq!(
+        rows.1,
+        [
+            "delivery_call",
+            "delivery_late",
+            "delivery",
+            "delivery_call",
+            "delivery",
+            "delivery_call"
+        ]
+    );
+    assert_eq!(rows.2, "self");
+}
+
+#[tokio::test]
+async fn a_post_being_sent_is_confirmed_once() {
+    let (_dir, store) = store().await;
+    let id = store
+        .transact(|u| {
+            let id = u.queue_post(&post("k1", "hi", ""), 1.0)?;
+            u.claim_post(2.0, Some(id))?;
+            u.confirm_post(id, "5.1", 3.0)?;
+            Ok(id)
+        })
+        .await
+        .unwrap();
+    let again = store
+        .transact(move |u| u.confirm_post(id, "5.1", 4.0))
+        .await
+        .unwrap_err();
+    assert_eq!(again.to_string(), "post was not being sent");
+}
+
+#[tokio::test]
+async fn jobs_are_claimed_progressed_and_completed() {
+    use fridica_core::store::Completed;
+    let (_dir, store) = store().await;
+    thread_with_job(&store).await;
+    let snapshot = store.transact(|u| u.work_snapshot()).await.unwrap();
+    assert_eq!(
+        (
+            snapshot.queued.len(),
+            snapshot.running.len(),
+            snapshot.workers.len()
+        ),
+        (1, 0, 1)
+    );
+    let claimed = claim_j1(&store).await;
+    assert_eq!(
+        (
+            claimed.job.status.as_str(),
+            claimed.job.attempt,
+            claimed.worker.slot
+        ),
+        ("running", 1, 1)
+    );
+    let (progressed, stale_progress, busy, context, missing) = store
+        .transact(|u| {
+            Ok((
+                u.record_job_progress("j1", 1, "halfway", 4.0)?,
+                u.record_job_progress("j1", 7, "old", 4.0)?,
+                u.busy_by_machine()?,
+                u.work_context("T:C:1")?,
+                u.job_record("nope").is_err(),
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(progressed && !stale_progress && missing);
+    assert_eq!(busy.get("m"), Some(&1));
+    assert_eq!(context["progress"][0]["note"], "halfway");
+    assert_eq!(context["jobs"][0]["id"], "j1");
+    let completion: fridica_core::store::Completion = serde_json::from_value(serde_json::json!({
+        "outcome":{"Err":{"kind":"refusal","code":"no"}},
+        "artifacts":[],"interrupted":false,"stopped":false,"allow_retry":false
+    }))
+    .unwrap();
+    let (stale, done, job, worker, files) = store
+        .transact(move |u| {
+            Ok((
+                u.complete_job("j1", 9, &completion, 5.0)?,
+                u.complete_job("j1", 1, &completion, 5.0)?,
+                u.job_record("j1")?,
+                u.worker_record("w1")?,
+                u.delegable_files("T:C:1")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!((stale, done), (Completed::Stale, Completed::Finished));
+    assert_eq!(job.status, "failed");
+    assert_eq!(worker.status, "idle");
+    assert!(files.is_empty());
+    let (snapshot, recovered) = store
+        .transact(|u| {
+            u.stop_worker("w1", "owner", 6.0)?;
+            Ok((u.previous_snapshot("w1", "j2")?, u.recover_jobs(7.0)?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot, None);
+    assert_eq!(recovered, 0);
+    assert_eq!(
+        store
+            .transact(|u| u.worker_record("w1"))
+            .await
+            .unwrap()
+            .status,
+        "stopped"
+    );
+}
+
+#[tokio::test]
+async fn approvals_begin_settle_and_cancel() {
+    use fridica_core::{
+        store::{ApprovalStart, NewApproval, Settlement},
+        worker::ApprovalDecision,
+    };
+    let (_dir, store) = store().await;
+    thread_with_job(&store).await;
+    let claimed = claim_j1(&store).await;
+    let request = |id: &str, automatic| NewApproval {
+        id: id.into(),
+        worker: claimed.worker.clone(),
+        job: claimed.job.clone(),
+        request: serde_json::from_value(serde_json::json!({
+            "backend_request_id":"b","kind":"tool","summary":"run it","detail":{"b":1,"a":2}
+        }))
+        .unwrap(),
+        automatic,
+        now: 4.0,
+        expires_at: 100.0,
+    };
+    let (first, second, automatic) = (
+        request("a1", None),
+        request("a2", None),
+        request("a3", Some(ApprovalDecision::Deny)),
+    );
+    let (started, denied, pending) = store
+        .transact(move |u| {
+            let started = u.begin_approval(&first)?;
+            u.begin_approval(&second)?;
+            Ok((
+                started,
+                u.begin_approval(&automatic)?,
+                u.pending_approvals(10)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(started, ApprovalStart::Pending);
+    assert_eq!(denied, ApprovalStart::Immediate(ApprovalDecision::Deny));
+    assert_eq!(pending.len(), 2);
+    let (accepted, repeated, cancelled, after) = store
+        .transact(|u| {
+            let accepted = u.settle_approval(
+                "a1",
+                Settlement::Decide(ApprovalDecision::Once),
+                "owner",
+                5.0,
+            )?;
+            let repeated = u.settle_approval("a1", Settlement::Cancel, "owner", 5.0)?;
+            u.cancel_worker_approvals("w1", 6.0)?;
+            let cancelled = u.approval("a2")?.unwrap();
+            u.cancel_pending_approvals(7.0)?;
+            Ok((accepted, repeated, cancelled, u.approval("a1")?.unwrap()))
+        })
+        .await
+        .unwrap();
+    assert!(accepted && !repeated);
+    assert_eq!(
+        (cancelled.status.as_str(), cancelled.decided_by.as_str()),
+        ("cancelled", "interrupted")
+    );
+    assert_eq!(
+        (after.status.as_str(), after.scope.as_str()),
+        ("approved", "once")
+    );
+    assert_eq!(
+        store
+            .transact(|u| u.approval("nope"))
+            .await
+            .unwrap()
+            .map(|a| a.id),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_is_fenced_by_its_job_attempt() {
+    let (_dir, store) = store().await;
+    thread_with_job(&store).await;
+    let claimed = claim_j1(&store).await;
+    let job = claimed.job.clone();
+    let (seq, accepted, again) = store
+        .transact(move |u| {
+            let request = serde_json::json!({"repo":"r"});
+            let seq = u.begin_fetch(&job, &request, 4.0)?.unwrap();
+            let result = serde_json::json!({"commit":"abc"});
+            let accepted = u.finish_fetch(&job, seq, &result, 5.0)?;
+            Ok((
+                seq,
+                accepted,
+                u.finish_fetch(&job, seq, &result, 6.0).is_err(),
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(accepted && again);
+    let events = store
+        .transact(move |u| u.events_after(seq - 1, 1))
+        .await
+        .unwrap();
+    assert_eq!(events[0].kind, "repo_fetch");
+    assert!(events[0].complete);
+    // A stale attempt fetches nothing.
+    let mut stale = claimed.job;
+    stale.attempt = 5;
+    assert_eq!(
+        store
+            .transact(move |u| u.begin_fetch(&stale, &serde_json::json!({}), 7.0))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn worker_controls_are_queued_current_and_completed() {
+    use fridica_core::parent::{ParentRequest, WorkerControl, WorkerOperation};
+    let (_dir, store) = store().await;
+    thread_with_job(&store).await;
+    claim_j1(&store).await;
+    let jobs = store
+        .transact(|u| u.controlled_jobs("T:C:1"))
+        .await
+        .unwrap();
+    let request: ParentRequest = serde_json::from_value(serde_json::json!({
+        "inbox_id":4,"call":"c","session":{"id":"T:C:1","work":{"jobs":jobs}},"trigger":{},
+        "history":[],"obligations":[],"previous":null,"errors":[]
+    }))
+    .unwrap();
+    let controls = [WorkerControl {
+        worker_id: "w1".into(),
+        op: WorkerOperation::Interrupt,
+    }];
+    let (current, pending, interrupt, listed) = store
+        .transact(move |u| {
+            let current = u.worker_controls_current(&request, &controls)?;
+            u.queue_worker_controls(&request, &controls, 5.0)?;
+            Ok((
+                current,
+                u.worker_control_pending("T:C:1")?,
+                u.interrupt_pending("j1", 1)?,
+                u.pending_worker_controls()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(current && pending && interrupt);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (
+            listed[0].intent.worker.as_str(),
+            listed[0].intent.job.as_deref(),
+            listed[0].intent.attempt
+        ),
+        ("w1", Some("j1"), Some(1))
+    );
+    let seq = listed[0].seq;
+    let (pending, recent) = store
+        .transact(move |u| {
+            u.complete_worker_control(seq, "interrupted", 6.0)?;
+            Ok((
+                u.worker_control_pending("T:C:1")?,
+                u.recent_worker_controls("T:C:1")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(!pending);
+    assert_eq!(recent[0]["outcome"], "interrupted");
+    assert_eq!(recent[0]["complete"], true);
+}
+
+#[tokio::test]
+async fn slack_scopes_are_read_when_recorded() {
+    let (_dir, store) = store().await;
+    assert_eq!(store.transact(|u| u.slack_scopes()).await.unwrap(), None);
+    store
+        .call(|c| {
+            c.execute(
+                "INSERT INTO meta(key,value) VALUES('slack_scopes','files:read')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.transact(|u| u.slack_scopes()).await.unwrap(),
+        Some("files:read".into())
+    );
+}
+
+#[tokio::test]
+async fn links_are_recorded_and_backfilled_once() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,created,updated) VALUES
+                    ('T:C:1','T','C','1',1,1),('T:C:2','T','C','2',1,1);
+                 INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at)
+                    VALUES('e1','T','C','2','2','U','see snapy/x#12','socket',90);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (first, second) = store
+        .transact(|u| {
+            u.record_links(
+                "T",
+                "C",
+                "T:C:1",
+                "about #12 and thread 1000000002.000000 and 2",
+                5.0,
+            )?;
+            Ok((
+                u.backfill_links(100.0, 50.0)?,
+                u.backfill_links(100.0, 50.0)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!((first, second), (1, 0));
+    let items = store
+        .call(|c| {
+            Ok(
+                c.prepare("SELECT session_id,item,repo FROM item_links ORDER BY session_id")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<(String, String, String)>>>()?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        items,
+        [
+            ("T:C:1".into(), "#12".into(), String::new()),
+            ("T:C:2".into(), "#12".into(), "x".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_archived_thread_is_found_and_revived() {
+    let (dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,summary,created,updated) VALUES('T:C:1','T','C','1','old work',1,1);
+                 INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at)
+                    VALUES('e1','T','C','1','1','U','find the needle','socket',1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let db = dir.path().join("state.sqlite3");
+    let limits = fridica_store_sqlite::archive::Limits {
+        threads_after: 10.0,
+        threads: 10,
+        events_after: 0.0,
+        events: 0,
+    };
+    let round = store
+        .call(move |c| fridica_store_sqlite::archive::round(c, &db, 1000.0, limits))
+        .await
+        .unwrap();
+    assert_eq!(round.threads, 1);
+    let (hits, never, revived, again) = store
+        .transact(|u| {
+            Ok((
+                u.search_archives("NEEDLE", 5)?,
+                u.revive_thread("T:C:9", 2000.0)?,
+                u.revive_thread("T:C:1", 2000.0)?,
+                u.revive_thread("T:C:1", 2001.0)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        (hits[0].thread.as_str(), hits[0].summary.as_str()),
+        ("T:C:1", "old work")
+    );
+    assert_eq!(hits[0].matches, ["1 U: find the needle"]);
+    assert!(!never && revived && !again);
+    assert!(store.transact(|u| u.thread_exists("T:C:1")).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_revival_that_fails_is_noted_and_undone() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute(
+                "INSERT INTO archived_threads(session_id,archive,last_activity,archived_at) VALUES('T:C:1','/nonexistent/2026-W01.sqlite3',1,2)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .transact(|u| u.revive_or_note("T:C:1", 3.0))
+        .await
+        .unwrap();
+    let (restored, noted) = store
+        .call(|c| {
+            let restored: Option<f64> = c.query_row(
+                "SELECT restored_at FROM archived_threads WHERE session_id='T:C:1'",
+                [],
+                |r| r.get(0),
+            )?;
+            let noted: String = c.query_row("SELECT kind FROM health_events", [], |r| r.get(0))?;
+            Ok((restored, noted))
+        })
+        .await
+        .unwrap();
+    assert_eq!(restored, None);
+    assert_eq!(noted, "archive_revive_failed");
+}
+
+#[tokio::test]
+async fn a_configuration_edit_is_pending_until_completed() {
+    use fridica_core::store::ConfigurationIntent;
+    let (_dir, store) = store().await;
+    assert_eq!(
+        store
+            .transact(|u| u.pending_configuration_edit())
+            .await
+            .unwrap(),
+        None
+    );
+    let intent = ConfigurationIntent {
+        path: "/etc/fridica.toml".into(),
+        before: "b".into(),
+        after: "a".into(),
+    };
+    fridica_store_sqlite::configuration::replace(&store, intent.clone(), 1.0, || Ok(()))
+        .await
+        .unwrap();
+    let pending = store
+        .transact(|u| u.pending_configuration_edit())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.intent, intent);
+    let seq = pending.seq;
+    let after = store
+        .transact(move |u| {
+            u.complete_configuration_edit(seq, true, 2.0)?;
+            u.pending_configuration_edit()
+        })
+        .await
+        .unwrap();
+    assert_eq!(after, None);
+    let events = store.transact(|u| u.events_after(0, 10)).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| (e.kind.as_str(), e.complete))
+            .collect::<Vec<_>>(),
+        [("configuration_edit", true), ("configuration_result", true)]
+    );
+    assert_eq!(
+        events[1].payload,
+        format!(r#"{{"call":{seq},"outcome":"applied"}}"#)
+    );
+}

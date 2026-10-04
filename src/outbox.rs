@@ -4,6 +4,7 @@ use super::Store;
 use anyhow::{bail, Context, Result};
 use fridica_core::{
     delivery::{ClaimedPost, DeliveryOutcome, Post},
+    store::PostOutcome,
     Authority,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -105,14 +106,17 @@ pub async fn ready(store: &Store, now: f64, limit: usize) -> Result<Vec<i64>> {
     if !now.is_finite() {
         bail!("invalid delivery time");
     }
-    store
-        .call(move |c| {
-            let sql = READY.replace("LIMIT 1", "LIMIT ?");
-            Ok(c.prepare(&sql)?
-                .query_map(params![now, limit.min(100) as i64], |r| r.get("id"))?
-                .collect::<rusqlite::Result<_>>()?)
-        })
-        .await
+    store.call(move |c| ready_tx(c, now, limit)).await
+}
+
+pub fn ready_tx(c: &Connection, now: f64, limit: usize) -> Result<Vec<i64>> {
+    if !now.is_finite() {
+        bail!("invalid delivery time");
+    }
+    let sql = READY.replace("LIMIT 1", "LIMIT ?");
+    Ok(c.prepare(&sql)?
+        .query_map(params![now, limit.min(100) as i64], |r| r.get("id"))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 pub async fn claim(store: &Store, now: f64) -> Result<Option<ClaimedPost>> {
@@ -130,28 +134,37 @@ async fn claim_matching(store: &Store, now: f64, id: Option<i64>) -> Result<Opti
     store
         .call(move |c| {
             let tx = c.transaction()?;
-            let item = if let Some(id) = id {
-                let sql = READY.replace("ORDER BY o.id", "AND o.id=? ORDER BY o.id");
-                tx.query_row(&sql, params![now, id], post).optional()?
-            } else {
-                tx.query_row(READY, [now], post).optional()?
-            };
-            let Some(mut item) = item else {
-                return Ok(None);
-            };
-            tx.execute(
-                "UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=?",
-                [item.id],
-            )?;
-            item.attempt += 1;
-            tx.execute(
-                "INSERT INTO replay_events(kind,time,payload_json,complete) VALUES('delivery_call',?,?,0)",
-                params![now, serde_json::to_string(&item)?],
-            )?;
+            let item = claim_tx(&tx, now, id)?;
             tx.commit()?;
-            Ok(Some(item))
+            Ok(item)
         })
         .await
+}
+
+/// Claim the next ready post, or post `id` when it is ready.
+pub fn claim_tx(tx: &Connection, now: f64, id: Option<i64>) -> Result<Option<ClaimedPost>> {
+    if !now.is_finite() {
+        bail!("invalid delivery time");
+    }
+    let item = if let Some(id) = id {
+        let sql = READY.replace("ORDER BY o.id", "AND o.id=? ORDER BY o.id");
+        tx.query_row(&sql, params![now, id], post).optional()?
+    } else {
+        tx.query_row(READY, [now], post).optional()?
+    };
+    let Some(mut item) = item else {
+        return Ok(None);
+    };
+    tx.execute(
+        "UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=?",
+        [item.id],
+    )?;
+    item.attempt += 1;
+    tx.execute(
+        "INSERT INTO replay_events(kind,time,payload_json,complete) VALUES('delivery_call',?,?,0)",
+        params![now, serde_json::to_string(&item)?],
+    )?;
+    Ok(Some(item))
 }
 
 pub fn fail_tx(c: &Connection, id: i64, state: &str, error: &str) -> Result<()> {
@@ -220,26 +233,63 @@ pub async fn complete(
     if !now.is_finite() {
         bail!("invalid delivery time");
     }
-    store.call(move |c| {
-        let tx=c.transaction()?;
-        let current=tx.query_row("SELECT * FROM outbox WHERE id=? AND state='sending' AND attempts=?",params![claim.id,claim.attempt],post).optional()?;
-        let raw = serde_json::to_value(&outcome)?;
-        if current.as_ref().is_none_or(|item| item.post != claim.post) {
-            tx.execute("INSERT INTO replay_events(kind,time,payload_json) VALUES('delivery_late',?,?)",
-                params![now,json!({"claim":claim,"result":raw}).to_string()])?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let done = complete_tx(&tx, &claim, &outcome, &owner, now)?;
             tx.commit()?;
-            bail!("stale delivery attempt or changed payload");
+            match done {
+                PostOutcome::Stale => bail!("stale delivery attempt or changed payload"),
+                PostOutcome::Sent => Ok(true),
+                PostOutcome::Unsent => Ok(false),
+            }
+        })
+        .await
+}
+
+/// Record a claimed delivery attempt's outcome. A stale attempt's result is
+/// recorded as late, and the caller commits that before it reports the error.
+pub fn complete_tx(
+    tx: &Connection,
+    claim: &ClaimedPost,
+    outcome: &DeliveryOutcome,
+    owner: &str,
+    now: f64,
+) -> Result<PostOutcome> {
+    if !now.is_finite() {
+        bail!("invalid delivery time");
+    }
+    {
+        let current = tx
+            .query_row(
+                "SELECT * FROM outbox WHERE id=? AND state='sending' AND attempts=?",
+                params![claim.id, claim.attempt],
+                post,
+            )
+            .optional()?;
+        let raw = serde_json::to_value(outcome)?;
+        if current.as_ref().is_none_or(|item| item.post != claim.post) {
+            tx.execute(
+                "INSERT INTO replay_events(kind,time,payload_json) VALUES('delivery_late',?,?)",
+                params![now, json!({"claim":claim,"result":raw}).to_string()],
+            )?;
+            return Ok(PostOutcome::Stale);
         }
         tx.execute("UPDATE replay_events SET complete=1 WHERE kind='delivery_call' AND json_extract(payload_json,'$.id')=? AND json_extract(payload_json,'$.attempt')=?",
             params![claim.id,claim.attempt])?;
-        let mut sent=false;
-        let record=match outcome {
-            DeliveryOutcome::Sent{reference} if !reference.is_empty()=>{
-                confirm_tx(&tx,claim.id,&reference,now)?;
-                let p=&claim.post;
-                if p.kind!="upload" {
-                    let workspace=p.session_id.split(':').next().filter(|v|!v.is_empty()).context("post missing workspace identity")?;
-                    let root=p.thread_ts.as_ref().unwrap_or(&reference);
+        let mut sent = false;
+        let record = match outcome.clone() {
+            DeliveryOutcome::Sent { reference } if !reference.is_empty() => {
+                confirm_tx(tx, claim.id, &reference, now)?;
+                let p = &claim.post;
+                if p.kind != "upload" {
+                    let workspace = p
+                        .session_id
+                        .split(':')
+                        .next()
+                        .filter(|v| !v.is_empty())
+                        .context("post missing workspace identity")?;
+                    let root = p.thread_ts.as_ref().unwrap_or(&reference);
                     // Slack may have delivered its own echo before the API result.
                     // Update that existing history row rather than duplicating it.
                     tx.execute("INSERT INTO messages(event_id,workspace,channel,ts,root_ts,thread_ts,sender,text,source,meta_json,received_at)
@@ -247,55 +297,97 @@ pub async fn complete(
                         params![format!("self:{}:{reference}",p.channel),workspace,p.channel,reference,root,p.thread_ts,owner,p.text,
                         p.meta.as_ref().map(serde_json::to_string).transpose()?,now])?;
                 }
-                sent=true;json!({"outcome":"sent","reference":reference})
-            },
-            DeliveryOutcome::RateLimited{retry_after} if retry_after.is_finite()=>{
-                let base:u32=tx.query_row("SELECT retry_base FROM outbox WHERE id=?",[claim.id],|r|r.get(0))?;
-                if claim.attempt.saturating_sub(base)>=5 {fail_tx(&tx,claim.id,"failed","rate limited 5 times")?;}
-                else {tx.execute("UPDATE outbox SET state='pending',retry_at=?,error='rate_limited' WHERE id=?",params![now+retry_after.clamp(1.,3600.),claim.id])?;}
+                sent = true;
+                json!({"outcome":"sent","reference":reference})
+            }
+            DeliveryOutcome::RateLimited { retry_after } if retry_after.is_finite() => {
+                let base: u32 = tx.query_row(
+                    "SELECT retry_base FROM outbox WHERE id=?",
+                    [claim.id],
+                    |r| r.get(0),
+                )?;
+                if claim.attempt.saturating_sub(base) >= 5 {
+                    fail_tx(tx, claim.id, "failed", "rate limited 5 times")?;
+                } else {
+                    tx.execute("UPDATE outbox SET state='pending',retry_at=?,error='rate_limited' WHERE id=?",params![now+retry_after.clamp(1.,3600.),claim.id])?;
+                }
                 json!({"outcome":"rate_limited","retry_after":retry_after})
-            },
-            DeliveryOutcome::Rejected{code}=>{
-                let code=safe_code(&code);fail_tx(&tx,claim.id,"failed",&code)?;
+            }
+            DeliveryOutcome::Rejected { code } => {
+                let code = safe_code(&code);
+                fail_tx(tx, claim.id, "failed", &code)?;
                 json!({"outcome":"rejected","code":code})
-            },
-            DeliveryOutcome::Ambiguous{code}=>{
-                let code=safe_code(&code);fail_tx(&tx,claim.id,"ambiguous",&code)?;
+            }
+            DeliveryOutcome::Ambiguous { code } => {
+                let code = safe_code(&code);
+                fail_tx(tx, claim.id, "ambiguous", &code)?;
                 json!({"outcome":"ambiguous","code":code})
-            },
-            _=>{fail_tx(&tx,claim.id,"ambiguous","invalid_adapter_result")?;json!({"outcome":"ambiguous","code":"invalid_adapter_result"})},
+            }
+            _ => {
+                fail_tx(tx, claim.id, "ambiguous", "invalid_adapter_result")?;
+                json!({"outcome":"ambiguous","code":"invalid_adapter_result"})
+            }
         };
         tx.execute("INSERT INTO replay_events(kind,time,payload_json) VALUES('delivery',?,?)",
             params![now,json!({"outbox_id":claim.id,"attempt":claim.attempt,"result":record,"raw_result":raw}).to_string()])?;
-        tx.commit()?;Ok(sent)
-    }).await
+        Ok(if sent {
+            PostOutcome::Sent
+        } else {
+            PostOutcome::Unsent
+        })
+    }
 }
 
 /// Call once before starting delivery tasks, while holding the store's daemon lock.
 pub async fn recover(store: &Store, now: f64) -> Result<usize> {
-    store.call(move |c| {
-        let tx=c.transaction()?;
-        let ids:Vec<i64>=tx.prepare("SELECT id FROM outbox WHERE state='sending' ORDER BY id")?
-            .query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let count = recover_tx(&tx, now)?;
+            tx.commit()?;
+            Ok(count)
+        })
+        .await
+}
+
+pub fn recover_tx(tx: &Connection, now: f64) -> Result<usize> {
+    {
+        let ids: Vec<i64> = tx
+            .prepare("SELECT id FROM outbox WHERE state='sending' ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         for id in &ids {
-            fail_tx(&tx,*id,"ambiguous","daemon_stopped_during_send")?;
+            fail_tx(tx, *id, "ambiguous", "daemon_stopped_during_send")?;
             tx.execute("INSERT INTO audit(time,actor,action,target,details_json) VALUES(?,'system','outbox.ambiguous',?,'{}')",params![now,id.to_string()])?;
         }
-        tx.commit()?;Ok(ids.len())
-    }).await
+        Ok(ids.len())
+    }
 }
 
 pub async fn requeue(store: &Store, id: i64, actor: Authority, now: f64) -> Result<bool> {
     if actor != Authority::Owner {
         bail!("only the owner may retry an uncertain or failed post");
     }
-    store.call(move |c| {
-        let tx=c.transaction()?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let retried = requeue_tx(&tx, id, actor, now)?;
+            tx.commit()?;
+            Ok(retried)
+        })
+        .await
+}
+
+pub fn requeue_tx(tx: &Connection, id: i64, actor: Authority, now: f64) -> Result<bool> {
+    if actor != Authority::Owner {
+        bail!("only the owner may retry an uncertain or failed post");
+    }
+    {
         if tx.execute("UPDATE outbox SET state='pending',retry_at=0,retry_base=attempts,error='' WHERE id=? AND state IN ('failed','ambiguous')",[id])?==0 {return Ok(false);}
         // Attempt numbers never reset: they fence delayed completions.
         tx.execute(&format!("{DEPENDENTS} UPDATE outbox SET state='pending',error='' WHERE state='blocked' AND idem_key IN (SELECT key FROM dependents)"),[id])?;
         tx.execute("UPDATE reply_reservations SET state='reserved',reserved_at=? WHERE outbox_id=? AND state='released'",params![now,id])?;
         tx.execute("INSERT INTO audit(time,actor,action,target,details_json) VALUES(?,'owner','outbox.retry',?,'{}')",params![now,id.to_string()])?;
-        tx.commit()?;Ok(true)
-    }).await
+        Ok(true)
+    }
 }

@@ -16,6 +16,7 @@
 //! could belong to another thread by the time this one comes back.
 use super::schema;
 use anyhow::{Context, Result};
+pub use fridica_core::store::ArchiveHit as Hit;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use serde_json::json;
@@ -452,15 +453,6 @@ pub fn revive_or_note(c: &Connection, session: &str, now: f64) -> Result<()> {
     Ok(())
 }
 
-/// A thread found in an archive.
-#[derive(Debug, Serialize)]
-pub struct Hit {
-    pub thread: String,
-    pub week: String,
-    pub last_activity: f64,
-    pub summary: String,
-    pub matches: Vec<String>,
-}
 /// Archived threads whose messages or summary contain `query` (case
 /// insensitive), newest week first. Reads the archive files only.
 pub fn search(db: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {

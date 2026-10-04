@@ -1,21 +1,22 @@
 //! Durable job admission and completion. Backend I/O never runs on this thread.
 use super::Store;
 use anyhow::{bail, Result};
+pub use fridica_core::store::{Completed, Completion, WorkSnapshot as Snapshot};
 use fridica_core::{
     config::{registry::Registry, Limits},
-    worker::{CollectedArtifact, Failure, Job, Outcome, WorkerFailure, WorkerRecord},
+    store::{ClaimedJob, PreviousSnapshot},
+    worker::{Failure, Job, WorkerFailure, WorkerRecord},
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 const JOB:&str="SELECT json_object('id',id,'worker_id',worker_id,'session_id',session_id,'brief',brief,'join_group',join_group,'inbox_id',inbox_id,'deliverable',deliverable,'fetch_repo',fetch_repo,'fetch_ref',fetch_ref,'files',json(files_json),'context',context,'snapshot',json(snapshot_json),'fork_from_worker',fork_from_worker,'status',status,'attempt',attempt,'work_item_id',work_item_id,'target_sha',target_sha,'target_tree',target_tree,'retry_of',retry_of,'clearance',clearance) FROM jobs";
 const WORKER:&str="SELECT json_object('id',id,'session_id',session_id,'machine',machine,'workspace',workspace,'backend',backend,'role',role,'ephemeral',json(CASE WHEN ephemeral THEN 'true' ELSE 'false' END),'backend_session_id',backend_session_id,'status',status,'slot',slot,'updated',updated) FROM workers";
-fn job(c: &Connection, id: &str) -> Result<Job> {
+pub fn job(c: &Connection, id: &str) -> Result<Job> {
     let raw: String = c.query_row(&format!("{JOB} WHERE id=?"), [id], |r| r.get(0))?;
     Ok(serde_json::from_str(&raw)?)
 }
-fn worker(c: &Connection, id: &str) -> Result<WorkerRecord> {
+pub fn worker(c: &Connection, id: &str) -> Result<WorkerRecord> {
     let raw: String = c.query_row(&format!("{WORKER} WHERE id=?"), [id], |r| r.get(0))?;
     Ok(serde_json::from_str(&raw)?)
 }
@@ -108,20 +109,28 @@ pub async fn previous_snapshot(
     job_id: String,
 ) -> Result<Option<(String, fridica_core::fork::ContextBundle)>> {
     store
-        .call(move |c| {
-            let row: Option<(String, String)> = c
-                .query_row(
-                    "SELECT id,snapshot_json FROM jobs WHERE worker_id=? AND id!=? AND attempt>0 AND snapshot_json IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1",
-                    params![worker_id, job_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            Ok(match row {
-                Some((id, raw)) => Some((id, serde_json::from_str(&raw)?)),
-                None => None,
-            })
-        })
+        .call(move |c| Ok(previous_snapshot_tx(c, &worker_id, &job_id)?.map(|p| (p.job, p.bundle))))
         .await
+}
+pub fn previous_snapshot_tx(
+    c: &Connection,
+    worker_id: &str,
+    job_id: &str,
+) -> Result<Option<PreviousSnapshot>> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT id,snapshot_json FROM jobs WHERE worker_id=? AND id!=? AND attempt>0 AND snapshot_json IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1",
+            params![worker_id, job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((id, raw)) => Some(PreviousSnapshot {
+            job: id,
+            bundle: serde_json::from_str(&raw)?,
+        }),
+        None => None,
+    })
 }
 /// Files attached in this thread by others, newest first, that a delegation
 /// may hand to a worker. Fridica's own uploads are left out.
@@ -173,16 +182,19 @@ fn elsewhere_tx(c: &Connection, session: &str) -> Result<Vec<serde_json::Value>>
         .collect::<rusqlite::Result<_>>()?;
     rows.iter().map(|r| Ok(serde_json::from_str(r)?)).collect()
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub queued: Vec<Job>,
-    pub running: Vec<Job>,
-    pub workers: Vec<WorkerRecord>,
-}
 pub async fn snapshot(store: &Store) -> Result<Snapshot> {
     store
         .call(|c| {
             let tx = c.transaction()?;
+            let snapshot = snapshot_tx(&tx)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+        .await
+}
+pub fn snapshot_tx(tx: &Connection) -> Result<Snapshot> {
+    {
+        {
             let read = |sql: String| -> Result<Vec<String>> {
                 Ok(tx
                     .prepare(&sql)?
@@ -205,14 +217,13 @@ pub async fn snapshot(store: &Store) -> Result<Snapshot> {
                 .iter()
                 .map(|v| serde_json::from_str(v))
                 .collect::<std::result::Result<_, _>>()?;
-            tx.commit()?;
             Ok(Snapshot {
                 queued,
                 running,
                 workers,
             })
-        })
-        .await
+        }
+    }
 }
 fn notify(c: &Connection, j: &Job, now: f64) -> Result<()> {
     c.execute("INSERT OR IGNORE INTO thread_inbox(session_id,kind,ref,created,dedup_key) VALUES(?,'worker_result',?,?,?)",
@@ -236,45 +247,94 @@ pub async fn claim(
     limits: Limits,
     now: f64,
 ) -> Result<Option<(Job, WorkerRecord)>> {
-    store.call(move|c|{
-        let tx=c.transaction()?;let mut j=job(&tx,&id)?;if j.status!="queued" || j.clearance!="worker"{return Ok(None);}
-        let mut w=worker(&tx,&j.worker_id)?;
-        let machine=machines.get(&w.machine);
-        let active:bool=tx.query_row("SELECT control='active' FROM threads WHERE id=?",[&j.session_id],|r|r.get(0))?;
-        if w.status=="stopped" || machine.is_none(){cancel(&tx,&j,if w.status=="stopped"{"worker stopped"}else{"machine no longer configured"},now)?;tx.commit()?;return Ok(None);}
-        let m=machine.unwrap();
-        if !j.work_item_id.is_empty(){
-            let head:Option<(String,String)>=tx.query_row("SELECT head_sha,head_tree FROM work_items WHERE id=?",[&j.work_item_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if head!=Some((j.target_sha.clone(),j.target_tree.clone())){cancel(&tx,&j,"work item head changed",now)?;tx.commit()?;return Ok(None);}
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let claimed = claim_tx(&tx, &id, slot, &machines, &limits, now)?;
+            tx.commit()?;
+            Ok(claimed.map(|c| (c.job, c.worker)))
+        })
+        .await
+}
+/// `claim` in the caller's transaction. A job cancelled here stays
+/// cancelled when the caller commits.
+pub fn claim_tx(
+    tx: &Connection,
+    id: &str,
+    slot: usize,
+    machines: &Registry,
+    limits: &Limits,
+    now: f64,
+) -> Result<Option<ClaimedJob>> {
+    {
+        let mut j = job(tx, id)?;
+        if j.status != "queued" || j.clearance != "worker" {
+            return Ok(None);
         }
-        if !active || super::worker_controls::pending_tx(&tx,&j.session_id)? {return Ok(None);}
-        if slot==0 || slot>m.max_jobs || (w.slot>0 && w.slot<=m.max_jobs && w.slot!=slot){bail!("invalid or changed sticky slot");}
+        let mut w = worker(tx, &j.worker_id)?;
+        let machine = machines.get(&w.machine);
+        let active: bool = tx.query_row(
+            "SELECT control='active' FROM threads WHERE id=?",
+            [&j.session_id],
+            |r| r.get(0),
+        )?;
+        if w.status == "stopped" || machine.is_none() {
+            cancel(
+                tx,
+                &j,
+                if w.status == "stopped" {
+                    "worker stopped"
+                } else {
+                    "machine no longer configured"
+                },
+                now,
+            )?;
+            return Ok(None);
+        }
+        let m = machine.unwrap();
+        if !j.work_item_id.is_empty() {
+            let head: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT head_sha,head_tree FROM work_items WHERE id=?",
+                    [&j.work_item_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if head != Some((j.target_sha.clone(), j.target_tree.clone())) {
+                cancel(tx, &j, "work item head changed", now)?;
+                return Ok(None);
+            }
+        }
+        if !active || super::worker_controls::pending_tx(tx, &j.session_id)? {
+            return Ok(None);
+        }
+        if slot == 0 || slot > m.max_jobs || (w.slot > 0 && w.slot <= m.max_jobs && w.slot != slot)
+        {
+            bail!("invalid or changed sticky slot");
+        }
         let (total,machine_count,worker_count,occupied):(i64,i64,i64,i64)=tx.query_row(
             "SELECT COUNT(*),COALESCE(SUM(w.machine=?),0),COALESCE(SUM(j.worker_id=?),0),COALESCE(SUM(w.machine=? AND w.slot=?),0) FROM jobs j JOIN workers w ON w.id=j.worker_id WHERE j.status='running'",
             params![w.machine,w.id,w.machine,i64::try_from(slot)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        if total as u64>=limits.max_jobs as u64 || machine_count as u64>=m.max_jobs as u64 || worker_count>0 || occupied>0{return Ok(None);}
+        if total as u64 >= limits.max_jobs as u64
+            || machine_count as u64 >= m.max_jobs as u64
+            || worker_count > 0
+            || occupied > 0
+        {
+            return Ok(None);
+        }
         tx.execute("UPDATE jobs SET status='running',started_at=?,finished_at=0,attempt=attempt+1 WHERE id=?",params![now,id])?;
-        if w.updated!=0. && now-w.updated>limits.session_timeout && j.retry_of.is_empty() {
+        if w.updated != 0. && now - w.updated > limits.session_timeout && j.retry_of.is_empty() {
             w.backend_session_id.clear();
         }
-        tx.execute("UPDATE workers SET status='running',slot=?,backend_session_id=? WHERE id=?",params![i64::try_from(slot)?,w.backend_session_id,w.id])?;
-        j.status="running".into();j.attempt+=1;w.slot=slot;
-        tx.commit()?;Ok(Some((j,w)))
-    }).await
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Completion {
-    pub outcome: std::result::Result<Outcome, WorkerFailure>,
-    pub artifacts: Vec<CollectedArtifact>,
-    pub interrupted: bool,
-    pub stopped: bool,
-    pub allow_retry: bool,
-}
-#[derive(Debug, PartialEq)]
-pub enum Completed {
-    Finished,
-    Retried,
-    Stale,
+        tx.execute(
+            "UPDATE workers SET status='running',slot=?,backend_session_id=? WHERE id=?",
+            params![i64::try_from(slot)?, w.backend_session_id, w.id],
+        )?;
+        j.status = "running".into();
+        j.attempt += 1;
+        w.slot = slot;
+        Ok(Some(ClaimedJob { job: j, worker: w }))
+    }
 }
 /// Record a progress note of a running job attempt and queue it for the
 /// job's thread (#105). A note for an attempt that is no longer running is
@@ -286,17 +346,46 @@ pub async fn progress(
     text: String,
     now: f64,
 ) -> Result<bool> {
-    store.call(move|c|{
-        let tx=c.transaction()?;
-        let session:Option<String>=tx.query_row("SELECT session_id FROM jobs WHERE id=? AND attempt=? AND status='running'",params![job_id,attempt],|r|r.get(0)).optional()?;
-        let Some(session)=session else {return Ok(false)};
-        let seq:i64=tx.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM job_progress WHERE job_id=? AND attempt=?",params![job_id,attempt],|r|r.get(0))?;
-        tx.execute("INSERT INTO job_progress(job_id,attempt,seq,text,created) VALUES(?,?,?,?,?)",params![job_id,attempt,seq,text,now])?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let recorded = progress_tx(&tx, &job_id, attempt, &text, now)?;
+            tx.commit()?;
+            Ok(recorded)
+        })
+        .await
+}
+pub fn progress_tx(
+    tx: &Connection,
+    job_id: &str,
+    attempt: u32,
+    text: &str,
+    now: f64,
+) -> Result<bool> {
+    {
+        let session: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM jobs WHERE id=? AND attempt=? AND status='running'",
+                params![job_id, attempt],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(session) = session else {
+            return Ok(false);
+        };
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM job_progress WHERE job_id=? AND attempt=?",
+            params![job_id, attempt],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO job_progress(job_id,attempt,seq,text,created) VALUES(?,?,?,?,?)",
+            params![job_id, attempt, seq, text, now],
+        )?;
         tx.execute("INSERT OR IGNORE INTO thread_inbox(session_id,kind,ref,payload_json,created,dedup_key) VALUES(?,'worker_progress',?,?,?,?)",
             params![session,job_id,json!({"attempt":attempt,"seq":seq}).to_string(),now,format!("worker-progress:{job_id}:{attempt}:{seq}")])?;
-        tx.commit()?;
         Ok(true)
-    }).await
+    }
 }
 pub async fn complete(
     store: &Store,
@@ -305,50 +394,115 @@ pub async fn complete(
     completion: Completion,
     now: f64,
 ) -> Result<Completed> {
-    store.call(move|c|{
-        let tx=c.transaction()?;let j=job(&tx,&id)?;
-        tx.execute("INSERT INTO replay_events(kind,time,payload_json) VALUES('worker_completion',?,?)",
-            params![now,json!({"job_id":id,"attempt":attempt,"completion":completion}).to_string()])?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let completed = complete_tx(&tx, &id, attempt, &completion, now)?;
+            tx.commit()?;
+            Ok(completed)
+        })
+        .await
+}
+pub fn complete_tx(
+    tx: &Connection,
+    id: &str,
+    attempt: u32,
+    completion: &Completion,
+    now: f64,
+) -> Result<Completed> {
+    {
+        let j = job(tx, id)?;
+        tx.execute(
+            "INSERT INTO replay_events(kind,time,payload_json) VALUES('worker_completion',?,?)",
+            params![
+                now,
+                json!({"job_id":id,"attempt":attempt,"completion":completion}).to_string()
+            ],
+        )?;
         tx.execute("UPDATE replay_events SET complete=1 WHERE kind='worker_call' AND json_extract(payload_json,'$.request.job_id')=? AND json_extract(payload_json,'$.request.attempt')=?",params![id,attempt])?;
-        if j.status!="running" || j.attempt!=attempt{tx.commit()?;return Ok(Completed::Stale);}
-        let w=worker(&tx,&j.worker_id)?;
-        let stopped=completion.stopped || w.status=="stopped";
-        let (mut status,result,session,error)=match &completion.outcome {
-            Ok(o)=>("done",Some(&o.result),o.backend_session_id.as_str(),String::new()),
-            Err(e)=>(match e.kind {Failure::Cancelled=>"cancelled",Failure::Interrupted=>"interrupted",_=>"failed"},None,e.backend_session_id.as_str(),safe_code(&e.code)),
+        if j.status != "running" || j.attempt != attempt {
+            return Ok(Completed::Stale);
+        }
+        let w = worker(tx, &j.worker_id)?;
+        let stopped = completion.stopped || w.status == "stopped";
+        let (mut status, result, session, error) = match &completion.outcome {
+            Ok(o) => (
+                "done",
+                Some(&o.result),
+                o.backend_session_id.as_str(),
+                String::new(),
+            ),
+            Err(e) => (
+                match e.kind {
+                    Failure::Cancelled => "cancelled",
+                    Failure::Interrupted => "interrupted",
+                    _ => "failed",
+                },
+                None,
+                e.backend_session_id.as_str(),
+                safe_code(&e.code),
+            ),
         };
-        let interrupted=completion.interrupted || super::worker_controls::interrupt_pending_tx(&tx,&id,attempt)?;
-        if interrupted && status!="cancelled" {status="interrupted";}
-        if stopped && status=="done"{status="interrupted";}
-        let resume=if session.is_empty(){w.backend_session_id.as_str()}else{session};
-        let control:String=tx.query_row("SELECT control FROM threads WHERE id=?",[&j.session_id],|r|r.get(0))?;
-        let retry=completion.allow_retry && !stopped && !interrupted && j.attempt==1 && !resume.is_empty() && control=="active" &&
+        let interrupted = completion.interrupted
+            || super::worker_controls::interrupt_pending_tx(tx, id, attempt)?;
+        if interrupted && status != "cancelled" {
+            status = "interrupted";
+        }
+        if stopped && status == "done" {
+            status = "interrupted";
+        }
+        let resume = if session.is_empty() {
+            w.backend_session_id.as_str()
+        } else {
+            session
+        };
+        let control: String = tx.query_row(
+            "SELECT control FROM threads WHERE id=?",
+            [&j.session_id],
+            |r| r.get(0),
+        )?;
+        let retry = completion.allow_retry && !stopped && !interrupted && j.attempt==1 && !resume.is_empty() && control=="active" &&
             // A usage limit (Failure::RateLimited) is never retried at once into
             // the same limit (#107); the parent sees its reset time instead.
             matches!(&completion.outcome,Err(e) if e.kind==Failure::Execution);
-        let retry_at=match &completion.outcome {Err(WorkerFailure{kind:Failure::RateLimited{retry_at},..})=>retry_at.map(|t|t as f64),_=>None};
-        let result_json=result.map(serde_json::to_string).transpose()?;
-        let summary=result.map(|r|r.summary.as_str()).unwrap_or("");
-        let retire=stopped || (w.ephemeral && !retry);
+        let retry_at = match &completion.outcome {
+            Err(WorkerFailure {
+                kind: Failure::RateLimited { retry_at },
+                ..
+            }) => retry_at.map(|t| t as f64),
+            _ => None,
+        };
+        let result_json = result.map(serde_json::to_string).transpose()?;
+        let summary = result.map(|r| r.summary.as_str()).unwrap_or("");
+        let retire = stopped || (w.ephemeral && !retry);
         tx.execute("UPDATE workers SET status=?,updated=?,backend_session_id=CASE WHEN ?='' THEN backend_session_id ELSE ? END,
             summary=CASE WHEN ?='' THEN summary ELSE ? END,last_result_json=COALESCE(?,last_result_json) WHERE id=?",
             params![if retire{"stopped"}else{"idle"},now,session,session,summary,summary,result_json,w.id])?;
         tx.execute("UPDATE approvals SET status='cancelled',decided_by='system',decided_at=? WHERE job_id=? AND status='pending'",params![now,id])?;
         if retry {
-            tx.execute("UPDATE jobs SET status='queued',error=?,retry_of=id WHERE id=?",params![error,id])?;
+            tx.execute(
+                "UPDATE jobs SET status='queued',error=?,retry_of=id WHERE id=?",
+                params![error, id],
+            )?;
             tx.execute("INSERT INTO audit(time,actor,action,target,details_json) VALUES(?,'system','job.retry',?,?)",params![now,id,json!({"attempt":attempt,"same_session":true}).to_string()])?;
-            tx.commit()?;return Ok(Completed::Retried);
+            return Ok(Completed::Retried);
         }
-        tx.execute("UPDATE jobs SET status=?,result_json=?,error=?,finished_at=?,retry_at=? WHERE id=?",params![status,result_json,error,now,retry_at,id])?;
-        for (index,a) in completion.artifacts.iter().enumerate(){
+        tx.execute(
+            "UPDATE jobs SET status=?,result_json=?,error=?,finished_at=?,retry_at=? WHERE id=?",
+            params![status, result_json, error, now, retry_at, id],
+        )?;
+        for (index, a) in completion.artifacts.iter().enumerate() {
             tx.execute("INSERT INTO artifacts(id,job_id,session_id,machine,path,kind,caption,size,blob,status,error) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![format!("artifact:{id}:{index}"),id,j.session_id,w.machine,a.reference.path,a.reference.kind,a.reference.caption,
                 i64::try_from(a.data.as_ref().map_or(0,Vec::len))?,a.data,if a.data.is_some(){"ready"}else{"rejected"},safe_code(&a.error)])?;
         }
-        notify(&tx,&j,now)?;
-        tx.execute("UPDATE threads SET updated=?,version=version+1 WHERE id=?",params![now,j.session_id])?;
-        tx.commit()?;Ok(Completed::Finished)
-    }).await
+        notify(tx, &j, now)?;
+        tx.execute(
+            "UPDATE threads SET updated=?,version=version+1 WHERE id=?",
+            params![now, j.session_id],
+        )?;
+        Ok(Completed::Finished)
+    }
 }
 fn safe_code(s: &str) -> String {
     if s.is_empty() {
@@ -398,21 +552,36 @@ pub fn stop_tx(c: &Connection, worker_id: &str, actor: &str, now: f64) -> Result
 }
 /// Startup only, after acquiring the daemon lock and before creating any backend.
 pub async fn recover(store: &Store, now: f64) -> Result<usize> {
-    store.call(move|c|{
-    let tx=c.transaction()?;
-    let ids:Vec<String>=tx.prepare("SELECT id FROM jobs WHERE status='running' ORDER BY started_at,rowid")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    for id in &ids{
-        let j=job(&tx,id)?;
-        tx.execute("UPDATE jobs SET status='interrupted',error='daemon_restarted',finished_at=? WHERE id=?",params![now,id])?;
-        tx.execute("UPDATE workers SET status=CASE WHEN status='stopped' OR ephemeral THEN 'stopped' ELSE 'idle' END,updated=? WHERE id=?",params![now,j.worker_id])?;
-        notify(&tx,&j,now)?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let count = recover_tx(&tx, now)?;
+            tx.commit()?;
+            Ok(count)
+        })
+        .await
+}
+pub fn recover_tx(tx: &Connection, now: f64) -> Result<usize> {
+    {
+        let ids: Vec<String> = tx
+            .prepare("SELECT id FROM jobs WHERE status='running' ORDER BY started_at,rowid")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in &ids {
+            let j = job(tx, id)?;
+            tx.execute("UPDATE jobs SET status='interrupted',error='daemon_restarted',finished_at=? WHERE id=?",params![now,id])?;
+            tx.execute("UPDATE workers SET status=CASE WHEN status='stopped' OR ephemeral THEN 'stopped' ELSE 'idle' END,updated=? WHERE id=?",params![now,j.worker_id])?;
+            notify(tx, &j, now)?;
+        }
+        tx.execute("UPDATE approvals SET status='cancelled',decided_by='system',decided_at=? WHERE status='pending'",[now])?;
+        Ok(ids.len())
     }
-    tx.execute("UPDATE approvals SET status='cancelled',decided_by='system',decided_at=? WHERE status='pending'",[now])?;
-    tx.commit()?;Ok(ids.len())
-}).await
 }
 pub async fn busy_by_machine(store: &Store) -> Result<BTreeMap<String, i64>> {
-    store.call(|c|{
-    Ok(c.prepare("SELECT w.machine,COUNT(*) FROM jobs j JOIN workers w ON w.id=j.worker_id WHERE j.status IN ('queued','running') GROUP BY w.machine")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
-}).await
+    store.call(|c| busy_by_machine_tx(c)).await
+}
+pub fn busy_by_machine_tx(c: &Connection) -> Result<BTreeMap<String, i64>> {
+    {
+        Ok(c.prepare("SELECT w.machine,COUNT(*) FROM jobs j JOIN workers w ON w.id=j.worker_id WHERE j.status IN ('queued','running') GROUP BY w.machine")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
 }

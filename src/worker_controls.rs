@@ -3,20 +3,10 @@
 use super::{work, Store};
 use anyhow::{Context, Result};
 use fridica_core::parent::{ParentRequest, WorkerControl, WorkerOperation};
+use fridica_core::store::PendingWorkerControl;
+pub use fridica_core::store::WorkerControlIntent as Intent;
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Intent {
-    pub session: String,
-    pub inbox: i64,
-    pub worker: String,
-    pub op: WorkerOperation,
-    pub job: Option<String>,
-    pub attempt: Option<u32>,
-}
 
 pub fn jobs_tx(c: &Connection, session: &str) -> Result<Vec<Value>> {
     let rows: Vec<String> = c.prepare("SELECT json_object('id',id,'worker_id',worker_id,'status',status,'attempt',attempt) FROM jobs WHERE session_id=? AND status IN ('queued','running') ORDER BY id")?
@@ -117,16 +107,46 @@ pub fn enqueue_tx(
 }
 
 pub async fn pending(store: &Store) -> Result<Vec<(i64, Intent)>> {
-    store.call(|c| {
+    store
+        .call(|c| {
+            Ok(pending_intents_tx(c)?
+                .into_iter()
+                .map(|p| (p.seq, p.intent))
+                .collect())
+        })
+        .await
+}
+
+/// Up to 128 pending controls, oldest first.
+pub fn pending_intents_tx(c: &Connection) -> Result<Vec<PendingWorkerControl>> {
+    {
         let rows: Vec<(i64,String)>=c.prepare("SELECT seq,payload_json FROM replay_events WHERE kind='parent_worker_control' AND complete=0 ORDER BY seq LIMIT 128")?
             .query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        rows.into_iter().map(|(id,raw)|Ok((id,serde_json::from_str(&raw)?))).collect()
-    }).await
+        rows.into_iter()
+            .map(|(id, raw)| {
+                Ok(PendingWorkerControl {
+                    seq: id,
+                    intent: serde_json::from_str(&raw)?,
+                })
+            })
+            .collect()
+    }
 }
 
 pub async fn complete(store: &Store, seq: i64, outcome: &'static str, now: f64) -> Result<()> {
-    store.call(move|c| {
-        let tx=c.transaction()?;
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            complete_tx(&tx, seq, outcome, now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// Record that control `seq` was carried out with `outcome`.
+pub fn complete_tx(tx: &Connection, seq: i64, outcome: &str, now: f64) -> Result<()> {
+    {
         if tx.execute("UPDATE replay_events SET complete=1 WHERE seq=? AND kind='parent_worker_control' AND complete=0",[seq])?==1 {
             let raw:String=tx.query_row("SELECT payload_json FROM replay_events WHERE seq=?",[seq],|r|r.get(0))?;
             let intent:Intent=serde_json::from_str(&raw)?;
@@ -134,6 +154,6 @@ pub async fn complete(store: &Store, seq: i64, outcome: &'static str, now: f64) 
             tx.execute("INSERT INTO replay_events(kind,time,payload_json) VALUES('parent_worker_control_result',?,?)",params![now,details.to_string()])?;
             tx.execute("INSERT INTO audit(time,actor,action,target,details_json) VALUES(?,'parent','worker.control_reconciled',?,?)",params![now,intent.worker,details.to_string()])?;
         }
-        tx.commit()?;Ok(())
-    }).await
+        Ok(())
+    }
 }

@@ -8,14 +8,19 @@ pub async fn slack_scopes(path: &Path) -> Option<String> {
                 .ok()?;
         db.busy_timeout(std::time::Duration::from_millis(100))
             .ok()?;
-        db.query_row(
-            "SELECT value FROM meta WHERE key = 'slack_scopes' AND length(value) <= 65536",
-            [],
-            |row| row.get(0),
-        )
-        .ok()
+        slack_scopes_tx(&db).ok().flatten()
     })
     .await
     .ok()
     .flatten()
+}
+/// The recorded Slack scopes, read on any connection.
+pub fn slack_scopes_tx(c: &rusqlite::Connection) -> anyhow::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(c.query_row(
+        "SELECT value FROM meta WHERE key = 'slack_scopes' AND length(value) <= 65536",
+        [],
+        |row| row.get(0),
+    )
+    .optional()?)
 }
