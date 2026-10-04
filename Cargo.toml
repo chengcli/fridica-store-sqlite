@@ -15,7 +15,7 @@ categories = ["database", "development-tools"]
 testing = []
 
 [dependencies]
-fridica-core = "0.2"
+fridica-core = "0.3"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
@@ -38,10 +38,7 @@ required-features = ["testing"]
 
 [dev-dependencies]
 # The storage contract's conformance suite (tests/conformance.rs).
-fridica-core = { version = "0.2", features = ["conformance"] }
+fridica-core = { version = "0.3", features = ["conformance"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# The storage contract (fridica#117) until the next fridica-core release.
-[patch.crates-io]
-fridica-core = { git = "https://github.com/chengcli/fridica-core", rev = "9231605060a21b619c5f78b13b1a8683ad0781dd" }
