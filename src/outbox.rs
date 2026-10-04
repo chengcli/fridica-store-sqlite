@@ -7,7 +7,7 @@ use fridica_core::{
     Authority,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde_json::json;
+use serde_json::{json, Value};
 
 const READY: &str = "SELECT o.* FROM outbox o WHERE o.state='pending' AND o.retry_at<=?
  AND (o.after='' OR EXISTS(SELECT 1 FROM outbox p WHERE p.idem_key=o.after AND p.state='sent'))
@@ -175,6 +175,38 @@ pub fn fail_tx(c: &Connection, id: i64, state: &str, error: &str) -> Result<()> 
     Ok(())
 }
 
+/// A refused reply or report gives the parent one turn to rewrite it: a
+/// `post_refused` inbox item naming the post and the rule it broke (fridica#119).
+/// The rewrite's own refusal queues nothing more, so a text that cannot pass
+/// costs one extra turn, not a loop. Uploads and notices are not retried.
+fn refused_tx(c: &Connection, claim: &ClaimedPost, code: &str, now: f64) -> Result<()> {
+    if !matches!(claim.post.kind.as_str(), "reply" | "report") {
+        return Ok(());
+    }
+    let inbox: i64 = claim
+        .post
+        .idem_key
+        .split(':')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let (class, source): (String, Option<String>) = c.query_row(
+        "SELECT (SELECT trigger_class FROM outbox WHERE id=?),(SELECT kind FROM thread_inbox WHERE id=?)",
+        params![claim.id, inbox],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if source.as_deref() == Some("post_refused") {
+        return Ok(());
+    }
+    let payload = json!({"outbox_id":claim.id,"code":code,"post_kind":claim.post.kind,"turn":claim.post.meta.as_ref().map(|m|m["turn"].clone()).unwrap_or(Value::Null),"class":class});
+    c.execute(
+        "INSERT OR IGNORE INTO thread_inbox(session_id,kind,ref,payload_json,created,dedup_key)
+         SELECT ?,'post_refused',?,?,?,? WHERE EXISTS(SELECT 1 FROM threads WHERE id=? AND control='active')",
+        params![claim.post.session_id, claim.id.to_string(), payload.to_string(), now, format!("post-refused:{}", claim.id), claim.post.session_id],
+    )?;
+    Ok(())
+}
+
 /// Common confirmation effects, also used by the attention adapter.
 pub fn confirm_tx(c: &Connection, id: i64, reference: &str, now: f64) -> Result<()> {
     if reference.is_empty() || !now.is_finite() {
@@ -191,7 +223,7 @@ pub fn confirm_tx(c: &Connection, id: i64, reference: &str, now: f64) -> Result<
         "UPDATE obligations SET state='answered',updated=? WHERE state='awaiting_delivery'
         AND id IN (SELECT obligation_id FROM obligation_posts WHERE outbox_id=?)
         AND NOT EXISTS(SELECT 1 FROM obligation_posts p JOIN outbox o ON p.outbox_id=o.id
-            WHERE p.obligation_id=obligations.id AND o.state!='sent')",
+            WHERE p.obligation_id=obligations.id AND o.state NOT IN ('sent','failed'))",
         params![now, id],
     )?;
     Ok(())
@@ -257,6 +289,7 @@ pub async fn complete(
             },
             DeliveryOutcome::Rejected{code}=>{
                 let code=safe_code(&code);fail_tx(&tx,claim.id,"failed",&code)?;
+                refused_tx(&tx,&claim,&code,now)?;
                 json!({"outcome":"rejected","code":code})
             },
             DeliveryOutcome::Ambiguous{code}=>{

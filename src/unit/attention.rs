@@ -127,7 +127,9 @@ impl Replies for Sqlite<'_> {
             params![answer.answers, answer.trigger, answer.post],
         )?;
         for obligation in &answer.obligations {
-            let changed=self.0.prepare_cached("UPDATE obligations SET state='awaiting_delivery',updated=? WHERE id=? AND session_id=? AND state IN ('open','deferred')")?
+            // Open or deferred, or awaiting a delivery that failed: a rewrite of a
+            // refused reply answers the asks the refused one did (fridica#119).
+            let changed=self.0.prepare_cached("UPDATE obligations SET state='awaiting_delivery',updated=? WHERE id=? AND session_id=? AND (state IN ('open','deferred') OR (state='awaiting_delivery' AND NOT EXISTS(SELECT 1 FROM obligation_posts p JOIN outbox o ON o.id=p.outbox_id WHERE p.obligation_id=obligations.id AND o.state!='failed')))")?
                 .execute(params![answer.time,obligation,answer.session])?;
             if changed != 1 {
                 return Ok(Some(obligation.clone()));
