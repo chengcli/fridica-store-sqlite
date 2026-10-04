@@ -443,3 +443,275 @@ async fn a_github_pause_keeps_the_later_end() {
         .unwrap();
     assert_eq!(until, (None, Some("20.5".to_string())));
 }
+
+#[tokio::test]
+async fn thread_controls_record_their_effects() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,status,control,created,updated) VALUES
+                    ('T:C:1','T','C','1','blocked','active',1,5);
+                 INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at) VALUES
+                    ('e1','T','C','1','1','U','one','slack',1),
+                    ('e2','T','C','2','1','B','reply','self',2),
+                    ('e3','T','C','3','1','U','three','slack',3);
+                 INSERT INTO workers(id,session_id,machine,workspace,backend,status,created,updated) VALUES
+                    ('W1','T:C:1','m','/w','claude','idle',1,1);
+                 INSERT INTO thread_inbox(session_id,kind,ref,state,created) VALUES
+                    ('T:C:1','message','e3','pending',3),('T:C:1','message','e3','pending',3);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (state, channel, live, point) = store
+        .transact(|u| {
+            u.set_control("T:C:1", "paused", r#"{"b":1,"a":2}"#, "why", 6.0, false)?;
+            Ok((
+                u.control_state("T:C:1")?,
+                u.thread_channel("T:C:1")?,
+                u.has_live_workers("T:C:1")?,
+                u.resume_point("T:C:1")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.control, "paused");
+    assert_eq!(state.details, r#"{"b":1,"a":2}"#);
+    assert_eq!(channel, ("T".into(), "C".into()));
+    assert!(live);
+    // The latest message from someone else since Fridica last posted.
+    assert_eq!(point.latest, Some(("e3".into(), 3.0)));
+    assert_eq!(point.newest, 3.0);
+    // An unknown thread is an error.
+    assert!(store.transact(|u| u.control_state("T:C:9")).await.is_err());
+    assert!(store.transact(|u| u.thread_channel("T:C:9")).await.is_err());
+
+    // Resuming reuses the first unfinished entry and finishes the others.
+    let inbox = store
+        .transact(|u| {
+            u.restart_turns("T:C:1")?;
+            u.reset_thread_at("T:C:1", 2.5)?;
+            u.resume_message("T:C:1", "e3", r#"{"resumed":true}"#, 7.0)?;
+            u.resume_message("T:C:1", "e1", r#"{"resumed":true}"#, 7.0)?;
+            u.audit_control(7.0, r#""owner""#, "thread.resume", "T:C:1", r#""resume""#)?;
+            Ok(())
+        })
+        .await;
+    inbox.unwrap();
+    type Inbox = Vec<(String, String, String)>;
+    let (rows, thread): (Inbox, (String, f64, i64)) = store
+        .call(|c| {
+            let rows = c
+                .prepare("SELECT ref,state,payload_json FROM thread_inbox ORDER BY id")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let thread = c.query_row(
+                "SELECT status,reset_at,turns FROM threads WHERE id='T:C:1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            Ok((rows, thread))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("e3".into(), "pending".into(), r#"{"resumed":true}"#.into()),
+            ("e3".into(), "done".into(), "{}".into()),
+            ("e1".into(), "pending".into(), r#"{"resumed":true}"#.into()),
+        ]
+    );
+    assert_eq!(thread, ("complete".into(), 2.5, 0));
+    let activity = store.transact(|u| u.activity(10)).await.unwrap();
+    assert!(serde_json::to_string(&activity)
+        .unwrap()
+        .contains("thread.resume"));
+
+    // Owner instructions are found by client ID; cleaning wipes their text.
+    let (id, found, missing) = store
+        .transact(|u| {
+            let id = u.queue_owner_instruction("T:C:1", "client-1", r#"{"text":"go"}"#, 8.0)?;
+            Ok((
+                id,
+                u.owner_instruction("T:C:1", "client-1")?,
+                u.owner_instruction("T:C:1", "client-2")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(found, Some((id, "go".into())));
+    assert_eq!(missing, None);
+    let (found, text, states) = store
+        .transact(|u| {
+            u.wipe("T:C:1", 9.0)?;
+            u.release_worker_results("T:C:1")?;
+            u.unblock("T:C:1")?;
+            Ok((
+                u.owner_instruction("T:C:1", "client-1")?,
+                u.thread_messages("T:C:1", 1)?,
+                u.thread("T:C:1")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(found, Some((id, String::new())));
+    assert!(serde_json::to_string(&text)
+        .unwrap()
+        .contains(r#"["text",{"Text":""}]"#));
+    assert!(states.is_some());
+    let dropped: i64 = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM thread_inbox WHERE state='dropped'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(dropped, 3);
+}
+
+#[tokio::test]
+async fn worker_stops_are_queued_once_per_worker() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,control,created,updated) VALUES
+                    ('T:C:1','T','C','1','closed',1,5),('T:C:2','T','C','2','active',1,5);
+                 INSERT INTO workers(id,session_id,machine,workspace,backend,status,created,updated) VALUES
+                    ('W1','T:C:1','m','/w','claude','idle',1,1),
+                    ('W2','T:C:1','m','/w','claude','stopped',1,1),
+                    ('W3','T:C:2','m','/w','claude','idle',1,1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (closed, before, pending, again, other) = store
+        .transact(|u| {
+            let closed = u.closed_threads_with_live_workers()?;
+            let before = u.worker_stop_pending("T:C:1")?;
+            u.queue_worker_stops(&closed, 2.0, false)?;
+            let pending = u.pending_worker_stops()?;
+            // A pending stop is not queued twice; stopped workers only on request.
+            u.queue_worker_stops(&closed, 3.0, true)?;
+            Ok((
+                closed,
+                before,
+                pending,
+                u.pending_worker_stops()?,
+                u.worker_stop_pending("T:C:2")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(closed, ["T:C:1"]);
+    assert!(!before);
+    assert_eq!(
+        pending
+            .iter()
+            .map(|s| s.worker.as_str())
+            .collect::<Vec<_>>(),
+        ["W1"]
+    );
+    assert_eq!(
+        again.iter().map(|s| s.worker.as_str()).collect::<Vec<_>>(),
+        ["W1", "W2"]
+    );
+    assert!(!other);
+    let (pending, after) = store
+        .transact(move |u| {
+            for stop in &again {
+                u.complete(stop.seq, true)?;
+            }
+            Ok((u.worker_stop_pending("T:C:1")?, u.pending_worker_stops()?))
+        })
+        .await
+        .unwrap();
+    assert!(!pending);
+    assert!(after.is_empty());
+    let events = store.transact(|u| u.events_after(0, 10)).await.unwrap();
+    assert_eq!(events[0].kind, "thread_worker_stop");
+    assert_eq!(events[0].payload, r#"{"session":"T:C:1","worker":"W1"}"#);
+}
+
+#[tokio::test]
+async fn linked_threads_are_read_with_their_state() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,status,control,summary,decisions_json,created,updated) VALUES
+                    ('T:C:1','T','C','1','idle','active','',  '[]',1,1),
+                    ('T:C:2','T','C','2','idle','active','two','[\"d\"]',1,4),
+                    ('T:C:3','T','C','3','idle','active','',  '[]',1,3),
+                    ('T:C:4','T','C','4','idle','closed','',  '[]',1,9),
+                    ('T:C:5','T','C','5','idle','active','',  '[]',1,2);
+                 INSERT INTO item_links(workspace,channel,item,session_id,repo,first_seen,last_seen) VALUES
+                    ('T','C','#7','T:C:1','o/r',1,1),('T','C','#7','T:C:2','',1,2),
+                    ('T','C','#7','T:C:4','',1,2),('T','C','#7','T:C:5','',1,100);
+                 INSERT INTO thread_links(session_id,target,created) VALUES('T:C:1','T:C:3',1),('T:C:2','T:C:1',1);
+                 INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at,meta_json) VALUES
+                    ('e1','T','C','2','2','U','root','slack',1,NULL),
+                    ('e2','T','C','3','2','U','middle','slack',1,NULL),
+                    ('e3','T','C','4','2','B','last','self',1,'{}');
+                 INSERT INTO obligations(id,session_id,kind,dedup_key,source_json,summary,created,due,updated) VALUES
+                    ('O1','T:C:2','ask','k1','{}','answer',1,5,1);
+                 INSERT INTO workers(id,session_id,machine,workspace,backend,role,created,updated) VALUES
+                    ('W1','T:C:2','m','/w','claude','coder',1,1);
+                 INSERT INTO jobs(id,worker_id,session_id,brief,status,queued_at,result_json) VALUES
+                    ('J1','W1','T:C:2','fix it','done',1,'{\"summary\":\"fixed\"}');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let linked = store
+        .transact(|u| u.linked_threads("T:C:1", 4, 10.0))
+        .await
+        .unwrap();
+    // Open threads only, most recently updated first; a stale shared item
+    // links nothing.
+    assert_eq!(
+        linked.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["T:C:2", "T:C:3"]
+    );
+    let two = &linked[0];
+    assert_eq!(two.shared_items, "#7");
+    assert!(!two.referenced && two.references_this);
+    assert!(linked[1].referenced && !linked[1].references_this);
+    assert_eq!(
+        (
+            two.root_ts.as_str(),
+            two.summary.as_str(),
+            two.decisions.as_str()
+        ),
+        ("2", "two", r#"["d"]"#)
+    );
+    assert_eq!(two.root, "root");
+    assert_eq!(linked[1].root, "");
+    assert_eq!(two.asks.len(), 1);
+    assert_eq!(two.asks[0].summary, "answer");
+    assert_eq!(two.jobs.len(), 1);
+    assert_eq!(
+        (two.jobs[0].role.as_str(), two.jobs[0].summary.as_str()),
+        ("coder", "fixed")
+    );
+    assert_eq!(
+        two.messages
+            .iter()
+            .map(|m| (m.text.as_str(), m.from_agent))
+            .collect::<Vec<_>>(),
+        [("middle", false), ("last", true)]
+    );
+    let limited = store
+        .transact(|u| u.linked_threads("T:C:1", 1, 10.0))
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+}
