@@ -14,8 +14,8 @@ mod modules;
 mod neighbours;
 mod views;
 
-/// The area traits over one connection or transaction. While Fridica still
-/// runs its own queries, it wraps a transaction in this to reach the traits.
+/// The area traits over one connection or transaction: a unit of work is one
+/// of these over a transaction. Tests also wrap a connection in it.
 pub struct Sqlite<'a>(pub &'a Connection);
 
 impl store::Store for Store {
