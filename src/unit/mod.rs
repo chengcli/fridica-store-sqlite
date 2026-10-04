@@ -6,7 +6,6 @@ use rusqlite::Connection;
 
 mod events;
 mod ledger;
-mod report;
 mod views;
 
 /// The area traits over one connection or transaction. While Fridica still
