@@ -160,9 +160,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fridica-core"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba56e258a3d6ff278e358b3e7be1e1eb80f71f98b0180ac74208137554cca94"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -176,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "fridica-store-sqlite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",

@@ -389,9 +389,7 @@ async fn thread_controls_record_their_effects() {
         .await
         .unwrap();
     assert_eq!(found, Some((id, String::new())));
-    assert!(serde_json::to_string(&text)
-        .unwrap()
-        .contains(r#"["text",{"Text":""}]"#));
+    assert_eq!(text[0].text, "");
     assert!(states.is_some());
     let dropped: i64 = store
         .call(|c| {
