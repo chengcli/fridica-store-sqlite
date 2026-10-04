@@ -1788,3 +1788,300 @@ async fn thread_turns_schedule_and_read_progress() {
         vec!["T:C:2".to_owned(), "T:C:1".to_owned()]
     );
 }
+fn parent_turn(call: &str, error: &str, blocked: Option<&str>) -> fridica_core::store::ParentTurn {
+    fridica_core::store::ParentTurn {
+        call: Some(call.into()),
+        response: r#"{"b":1,"a":2}"#.into(),
+        context: r#"{"call":"decide"}"#.into(),
+        error: error.into(),
+        created: Some(3.0),
+        blocked: blocked.map(str::to_owned),
+    }
+}
+
+#[tokio::test]
+async fn a_turn_loads_its_thread_and_settles_only_while_current() {
+    let (_dir, store) = store().await;
+    let (input, roots, decisions, live, stale, held, done, attempts) = store
+        .transact(|u| {
+            u.keep_message(&arrived("e1", "1.0", "<@U1> hi"))?;
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            let first = u.queue_message("T:C:1.0", "e1", 2.0)?;
+            u.claim_next("T:C:1.0", 5.0)?;
+            let input = u.turn_input("T:C:1.0", first)?;
+            let roots = u.earlier_roots(Some("T"), Some("C"), Some("2.0"))?;
+            let decisions = u.turn_decisions("T:C:1.0")?;
+            let live = u.turn_live("T:C:1.0", Some(0), first)?;
+            let version: i64 = serde_json::from_str::<serde_json::Value>(&input.thread)?["version"]
+                .as_i64()
+                .unwrap();
+            let settle = |version, until| fridica_core::store::Settlement {
+                id: first,
+                session: "T:C:1.0".into(),
+                version,
+                event: Some("e1".into()),
+                verdict: "observe: test".into(),
+                until,
+            };
+            // A stale version only puts the item back.
+            let stale = u.settle_turn(&settle(version + 1, None))?;
+            u.claim_next("T:C:1.0", 5.0)?;
+            let held = u.settle_turn(&settle(version, Some(40.0)))?;
+            u.claim_next("T:C:1.0", 50.0)?;
+            let done = u.settle_turn(&settle(version, None))?;
+            Ok((
+                input,
+                roots,
+                decisions,
+                live,
+                stale,
+                held,
+                done,
+                u.inbox_attempts(first)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (input.kind.as_str(), input.reference.as_str()),
+        ("message", "e1")
+    );
+    assert!(input.message.unwrap().contains(r#""event_id":"e1""#));
+    assert_eq!(
+        (input.from_peer, input.history.len(), input.review_required),
+        (None, 1, false)
+    );
+    assert_eq!(roots.len(), 1);
+    assert_eq!(decisions.1, 0);
+    assert!(live && !stale && held && done);
+    assert_eq!(attempts, (0, "done".into()));
+    let verdict: String = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT verdict FROM messages WHERE event_id='e1'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(verdict, "observe: test");
+}
+
+#[tokio::test]
+async fn a_failed_or_rate_limited_turn_keeps_its_evidence() {
+    let (_dir, store) = store().await;
+    let (current, recovered, triaged) = store
+        .transact(|u| {
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            let first = u.queue_message("T:C:1.0", "e1", 2.0)?;
+            u.claim_next("T:C:1.0", 5.0)?;
+            u.fail_turn(&fridica_core::store::TurnFailure {
+                id: first,
+                session: "T:C:1.0".into(),
+                state: "pending".into(),
+                not_before: 35.0,
+                signal: "inbox-failed:1".into(),
+                source: r#"{"inbox_id":1}"#.into(),
+                details: r#"{"inbox_id":1,"attempt":1}"#.into(),
+                now: 5.0,
+            })?;
+            u.claim_next("T:C:1.0", 40.0)?;
+            let current = u.retry_turn(&fridica_core::store::TurnRetry {
+                id: first,
+                session: "T:C:1.0".into(),
+                version: Some(0),
+                calls: vec![parent_turn("decide", "parent_rate_limited", None)],
+                retry_at: 100.0,
+                details: r#"{"retry_at":100.0}"#.into(),
+                now: 40.0,
+            })?;
+            u.claim_next("T:C:1.0", 100.0)?;
+            let recovered = u.recover_turns()?;
+            u.claim_next("T:C:1.0", 100.0)?;
+            let triaged = u.settle_triage(&fridica_core::store::TriageSettlement {
+                id: first,
+                session: "T:C:1.0".into(),
+                version: Some(0),
+                calls: vec![parent_turn("triage", "", None)],
+                event: None,
+                verdict: "ignore: triage".into(),
+                now: 101.0,
+            })?;
+            Ok((current, recovered, triaged))
+        })
+        .await
+        .unwrap();
+    assert!(current && triaged);
+    assert_eq!(recovered, 1);
+    let rows = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT group_concat(call||':'||action_json||':'||error||':'||response_json,'|') FROM parent_turns),
+                    (SELECT state||':'||attempts FROM thread_inbox),
+                    (SELECT source_json FROM obligations WHERE id='inbox-failed:1'),
+                    (SELECT group_concat(action,',') FROM audit),
+                    (SELECT version FROM threads)",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        (
+            r#"decide:{}:parent_rate_limited:{"b":1,"a":2}|triage:{}::{"b":1,"a":2}"#.into(),
+            "done:1".into(),
+            r#"{"inbox_id":1}"#.into(),
+            "inbox.failed,parent.rate_limited".into(),
+            1
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_committed_turn_records_its_effects_once_fenced() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute("INSERT INTO outbox(id,idem_key,session_id,kind,channel,created) VALUES(7,'1:reply','T:C:1.0','reply','C',1.0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (fence, arrival, again, running, class, changed, unchanged) = store
+        .transact(|u| {
+            u.keep_message(&arrived("e1", "1.0", "hi"))?;
+            u.keep_message(&arrived("e2", "3.0", "later"))?;
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            u.open_thread("T:C:2.0", "T", "C", "2.0", 2.0)?;
+            let first = u.queue_message("T:C:1.0", "e1", 2.0)?;
+            u.claim_next("T:C:1.0", 5.0)?;
+            let fence = u.fence_turn("T:C:1.0", first)?;
+            let arrival = u.arrival("T:C:1.0", first, Some(1.0), "U1")?;
+            let again = u.arrival("T:C:1.0", first, Some(1.0), "U1")?;
+            u.mark_unsolicited(Some("T"), Some("C"), 6.0)?;
+            assert_eq!(u.last_unsolicited(Some("T"), Some("C"))?, Some(6.0));
+            u.patch_context("T:C:1.0", r#"{"repo":"x"}"#)?;
+            u.label_post(7, r#"{"v":2}"#, "e1", true)?;
+            u.mark_reported("T:C:1.0", &[Some("j1".into()), None])?;
+            let running = u.jobs_running("T:C:1.0")?;
+            let class = u.handoff_class(first)?;
+            let handoff = |target: &str| fridica_core::store::QueuedHandoff {
+                target: target.into(),
+                from: "T:C:1.0".into(),
+                payload: "{}".into(),
+                dedup_key: format!("handoff:{target}"),
+                queued: r#"{"queued":true}"#.into(),
+                skipped: r#"{"queued":false}"#.into(),
+            };
+            u.queue_handoffs(&[handoff("T:C:2.0"), handoff("T:C:9.0")], 6.0)?;
+            u.open_asks(
+                "T:C:1.0",
+                &[fridica_core::store::NewAsk {
+                    id: "ask:1:0".into(),
+                    source: "{}".into(),
+                    summary: "Answer".into(),
+                    due: 50.0,
+                }],
+                6.0,
+            )?;
+            u.answer_for_handoff("T:C:1.0", &["ask:1:0".into(), "missing".into()], 7, 6.0)?;
+            u.open_asks(
+                "T:C:1.0",
+                &[fridica_core::store::NewAsk {
+                    id: "ask:1:1".into(),
+                    source: "{}".into(),
+                    summary: "Later".into(),
+                    due: 50.0,
+                }],
+                6.0,
+            )?;
+            let change = |id: &str| fridica_core::store::ObligationChange {
+                id: id.into(),
+                state: "deferred".into(),
+                details: r#"{"until":60.0}"#.into(),
+                due: Some(60.0),
+            };
+            let changed = u.change_obligations("T:C:1.0", &[change("ask:1:1")], 6.0)?;
+            let unchanged = u.change_obligations("T:C:1.0", &[change("ask:1:0")], 6.0)?;
+            u.open_streak_signal("streak:T:C:1.0:1", "T:C:1.0", r#"{"inbox_id":1}"#, 6.0)?;
+            u.open_streak_signal("streak:T:C:1.0:1", "T:C:1.0", r#"{"inbox_id":1}"#, 7.0)?;
+            u.record_parent_calls(
+                "T:C:1.0",
+                first,
+                r#"{"reply":null}"#,
+                &[parent_turn(
+                    "decide",
+                    "parent_unavailable",
+                    Some(r#"{"reason":"parent_unavailable"}"#),
+                )],
+                6.0,
+            )?;
+            u.close_turn(&fridica_core::store::TurnClose {
+                session: "T:C:1.0".into(),
+                status: "complete".into(),
+                reply_key: "1:reply".into(),
+                turn: 1,
+                waiting: 0,
+                quiet: 0,
+                hash: "h".into(),
+                summary: String::new(),
+                now: 6.0,
+            })?;
+            u.finish_turn(first, Some("e1"), "respond: test")?;
+            Ok((fence, arrival, again, running, class, changed, unchanged))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fence,
+        fridica_core::store::Fence {
+            version: 0,
+            active: true
+        }
+    );
+    assert_eq!(
+        arrival,
+        fridica_core::store::Arrival {
+            arrived: true,
+            reread: false
+        }
+    );
+    assert_eq!(
+        again,
+        fridica_core::store::Arrival {
+            arrived: true,
+            reread: true
+        }
+    );
+    assert!(!running && changed && !unchanged);
+    assert_eq!(class, "peer");
+    let rows = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT kind||':'||meta_json||':'||trigger_event FROM outbox WHERE id=7),
+                    (SELECT context_json||':'||status||':'||turns||':'||version||':'||last_reply_hash FROM threads WHERE id='T:C:1.0'),
+                    (SELECT group_concat(session_id||'='||kind,',') FROM thread_inbox),
+                    (SELECT group_concat(id||'='||state,',') FROM obligations),
+                    (SELECT group_concat(details_json,',') FROM audit),
+                    (SELECT count(*) FROM obligation_posts)",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        (
+            r#"report:{"v":2}:e1"#.into(),
+            r#"{"repo":"x"}:complete:1:1:h"#.into(),
+            "T:C:1.0=message,T:C:2.0=handoff".into(),
+            "ask:1:0=awaiting_delivery,ask:1:1=deferred,streak:T:C:1.0:1=open".into(),
+            r#"{"queued":true},{"queued":false},{"reason":"parent_unavailable"}"#.into(),
+            1
+        )
+    );
+}

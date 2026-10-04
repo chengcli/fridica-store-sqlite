@@ -4,6 +4,7 @@ use crate::Store;
 use fridica_core::store::{self, Pending, Work};
 use rusqlite::Connection;
 
+mod actor;
 mod attention;
 mod controls;
 mod events;
