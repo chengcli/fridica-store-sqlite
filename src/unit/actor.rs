@@ -284,6 +284,14 @@ impl Turns for Sqlite<'_> {
         )?;
         Ok(())
     }
+    fn refused_post(&mut self, session: &str, outbox: i64) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT json_object('outbox_id',id,'post_kind',kind,'state',state,'code',error,'text',text,'trigger_event',trigger_event,'turn',json_extract(meta_json,'$.turn')) FROM outbox WHERE id=? AND session_id=?",params![outbox,session],|r|r.get(0)).ok())
+    }
+    fn undelivered_posts(&mut self, session: &str) -> Result<Vec<String>> {
+        let posts = self.0.prepare_cached("SELECT json_object('outbox_id',id,'kind',kind,'state',state,'code',error,'turn',json_extract(meta_json,'$.turn')) FROM outbox WHERE session_id=? AND state IN ('failed','ambiguous') AND kind IN ('reply','report') ORDER BY id DESC LIMIT 3")?
+            .query_map([session],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(posts)
+    }
 }
 
 impl Sessions for Sqlite<'_> {

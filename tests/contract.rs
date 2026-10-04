@@ -2733,3 +2733,13 @@ async fn a_configuration_edit_is_pending_until_completed() {
         format!(r#"{{"call":{seq},"outcome":"applied"}}"#)
     );
 }
+
+#[tokio::test]
+async fn a_thread_without_refused_posts_has_none_to_rewrite() {
+    let (_dir, store) = store().await;
+    let (refused, undelivered) = store
+        .transact(|u| Ok((u.refused_post("W:C:1", 7)?, u.undelivered_posts("W:C:1")?)))
+        .await
+        .unwrap();
+    assert_eq!((refused, undelivered), (None, vec![]));
+}
