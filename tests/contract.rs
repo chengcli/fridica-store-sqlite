@@ -605,3 +605,293 @@ async fn the_supervisor_interrupts_and_fingerprints_workers() {
     );
     assert_eq!(rows.2, "");
 }
+fn arrived(event: &str, ts: &str, text: &str) -> fridica_core::store::ArrivedMessage {
+    fridica_core::store::ArrivedMessage {
+        event_id: event.into(),
+        workspace: "T".into(),
+        channel: "C".into(),
+        ts: ts.into(),
+        root_ts: "1.0".into(),
+        thread_ts: (ts != "1.0").then(|| "1.0".into()),
+        sender: "U2".into(),
+        text: text.into(),
+        files: "[]".into(),
+        source: "socket".into(),
+        meta: Some(r#"{"b":1,"a":2}"#.into()),
+        received_at: 2.0,
+        attachments: "[]".into(),
+        mentions_owner: text.contains("<@U1>"),
+    }
+}
+
+#[tokio::test]
+async fn intake_keeps_messages_once_and_claims_one_item_at_a_time() {
+    let (_dir, store) = store().await;
+    let (new, again, waiting, first, second, claimed, busy) = store
+        .transact(|u| {
+            let new = u.keep_message(&arrived("e1", "1.0", "hi"))?;
+            let again = u.keep_message(&arrived("e1", "1.0", "hi"))?;
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 9.0)?;
+            let waiting = u.thread_waiting("T:C:1.0")?;
+            let first = u.queue_message("T:C:1.0", "e1", 2.0)?;
+            let second = u.queue_message("T:C:1.0", "e2", 3.0)?;
+            let claimed = u.claim_next("T:C:1.0", 5.0)?;
+            let busy = u.claim_next("T:C:1.0", 5.0)?;
+            Ok((new, again, waiting, first, second, claimed, busy))
+        })
+        .await
+        .unwrap();
+    assert!(new && !again && !waiting && second > first);
+    assert_eq!(
+        claimed,
+        Some(fridica_core::store::InboxItem {
+            id: first,
+            kind: "message".into()
+        })
+    );
+    assert_eq!(busy, None);
+    let (meta, created) = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT meta_json FROM messages WHERE event_id='e1'),(SELECT created FROM threads WHERE id='T:C:1.0')",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!((meta.as_str(), created), (r#"{"b":1,"a":2}"#, 2.0));
+}
+
+#[tokio::test]
+async fn a_reserved_reply_is_answered_once_its_obligations_are_open() {
+    let (_dir, store) = store().await;
+    store
+        .call(|c| {
+            c.execute("INSERT INTO outbox(id,idem_key,session_id,kind,channel,created) VALUES(7,'k','T:C:1.0','reply','C',1.0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let found = store
+        .transact(|u| {
+            assert!(u.thread_active("T:C:1.0").is_err());
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            let inbox = u.queue_message("T:C:1.0", "e1", 2.0)?;
+            assert!(u.thread_active("T:C:1.0")? && u.inbox_open(inbox, "T:C:1.0")?);
+            assert!(!u.inbox_open(inbox, "T:C:2.0")?);
+            assert_eq!(u.reservation_state(inbox)?, None);
+            assert!(u.reserved_reply(inbox, "T:C:1.0").is_err());
+            u.reserve_reply("r1", "T:C:1.0", inbox, "peer", 3.0)?;
+            u.open_mention(&fridica_core::store::Mention {
+                id: "o1".into(),
+                session: "T:C:1.0".into(),
+                dedup_key: "mention:T:C:1.0".into(),
+                source: r#"{"event_id":"e1"}"#.into(),
+                created: 2.0,
+                due: 9.0,
+            })?;
+            let answer = fridica_core::store::QueuedAnswer {
+                post: 7,
+                session: "T:C:1.0".into(),
+                inbox,
+                trigger: "peer".into(),
+                obligations: vec!["o1".into()],
+                answers: r#"["o1"]"#.into(),
+                time: 4.0,
+            };
+            let before = (
+                u.reservation_state(inbox)?,
+                u.reserved_reply(inbox, "T:C:1.0")?,
+                u.recent_replies("T:C:1.0", 5.0)?,
+                u.thread_route("T:C:1.0")?,
+            );
+            let answered = u.answer_queued(&answer)?;
+            let reserved = u.reserved_reply(inbox, "T:C:1.0")?;
+            let again = u.answer_queued(&answer)?;
+            u.defer_reply("T:C:1.0", inbox, 50.0)?;
+            Ok((before, answered, reserved, again, u.obligation_state("o1")?))
+        })
+        .await
+        .unwrap();
+    let ((state, reserved, recent, route), answered, after, again, obligation) = found;
+    assert_eq!(state.as_deref(), Some("reserved"));
+    assert_eq!(
+        reserved,
+        fridica_core::store::ReservedReply {
+            trigger: "peer".into(),
+            post: None
+        }
+    );
+    assert_eq!(
+        recent,
+        [fridica_core::store::RecentReply {
+            trigger: "peer".into(),
+            at: 5.0
+        }]
+    );
+    assert_eq!(
+        route,
+        fridica_core::store::Route {
+            channel: "C".into(),
+            root_ts: "1.0".into()
+        }
+    );
+    assert_eq!((answered, after.post), (None, Some(7)));
+    assert_eq!(again.as_deref(), Some("o1"));
+    assert_eq!(obligation, "awaiting_delivery");
+    let rows = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT answers_json FROM outbox WHERE id=7),(SELECT count(*) FROM obligation_posts),(SELECT state||':'||not_before FROM thread_inbox),(SELECT throttled_until FROM threads)",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, f64>(3)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, (r#"["o1"]"#.into(), 1, "pending:50.0".into(), 50.0));
+}
+
+#[tokio::test]
+async fn obligations_are_signalled_disposed_and_queued_when_due() {
+    let (_dir, store) = store().await;
+    let (opened, reopened, queued, again, disposed, closed, state) = store
+        .transact(|u| {
+            assert!(u.obligation_state("s1").is_err());
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            let opened = u.open_signal("s1", "T:C:1.0", 3.0)?;
+            let reopened = u.open_signal("s1", "T:C:1.0", 4.0)?;
+            let queued = u.queue_due(5.0)?;
+            let again = u.queue_due(6.0)?;
+            let disposal = fridica_core::store::Disposal {
+                id: "s1".into(),
+                state: "declined".into(),
+                details: r#"{"kind":"declined","reason":"no"}"#.into(),
+                due: None,
+                actor: r#""owner""#.into(),
+                time: 7.0,
+            };
+            let disposed = u.dispose(&disposal)?;
+            let closed = u.dispose(&disposal)?;
+            Ok((
+                opened,
+                reopened,
+                queued,
+                again,
+                disposed,
+                closed,
+                u.obligation_state("s1")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(opened && !reopened && disposed && !closed);
+    assert_eq!((queued, again, state.as_str()), (1, 0, "declined"));
+    let audit = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*),max(details_json),max(actor) FROM audit WHERE action='obligation.disposition'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        audit,
+        (
+            1,
+            r#"{"kind":"declined","reason":"no"}"#.into(),
+            r#""owner""#.into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_historical_review_opens_deferred_mentions_and_is_found_by_client_id() {
+    let (_dir, store) = store().await;
+    let (found, after, prior, missing) = store
+        .transact(|u| {
+            u.open_thread("T:C:1.0", "T", "C", "1.0", 2.0)?;
+            u.keep_message(&arrived("e1", "1.0", "hi"))?;
+            u.keep_message(&arrived("e2", "3.0", "<@U1> look"))?;
+            u.keep_message(&arrived("e3", "9.0", "<@U1> later"))?;
+            let query = fridica_core::store::MentionQuery {
+                workspace: "T".into(),
+                channels: r#"["C"]"#.into(),
+                since: 0.0,
+                until: 5.0,
+                owner: "U1".into(),
+                mention: "<@U1>".into(),
+            };
+            let found = u.historical_mentions(&query)?;
+            let obligations = found
+                .iter()
+                .map(|m| fridica_core::store::HistoricalObligation {
+                    id: format!("backfill:mention:T:C:{}", m.ts),
+                    session: m.session.clone(),
+                    dedup_key: format!("mention:T:C:{}", m.ts),
+                    event_id: m.event_id.clone(),
+                    source: "{}".into(),
+                    created: m.received_at,
+                    due: 20.0,
+                    state: r#"{"kind":"deferred"}"#.into(),
+                    updated: 10.0,
+                })
+                .collect();
+            u.apply_backfill(&fridica_core::store::Backfill {
+                obligations,
+                time: 10.0,
+                actor: "U1".into(),
+                client_id: "client-1".into(),
+                result: r#"{"count":1}"#.into(),
+            })?;
+            u.record(
+                "obligations_backfill",
+                10.0,
+                r#"{"request":{"client_id":"client-1"},"result":{"count":1}}"#,
+                true,
+            )?;
+            Ok((
+                found,
+                u.historical_mentions(&query)?,
+                u.backfill_record("client-1")?,
+                u.backfill_record("client-2")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        [fridica_core::store::HistoricalMention {
+            event_id: "e2".into(),
+            session: "T:C:1.0".into(),
+            workspace: "T".into(),
+            channel: "C".into(),
+            ts: "3.0".into(),
+            received_at: 2.0
+        }]
+    );
+    assert_eq!(after, []);
+    assert_eq!(
+        prior.as_deref(),
+        Some(r#"{"request":{"client_id":"client-1"},"result":{"count":1}}"#)
+    );
+    assert_eq!(missing, None);
+    let rows = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT state FROM obligations),(SELECT group_concat(event_id) FROM messages WHERE mentions_owner=1),(SELECT details_json FROM audit WHERE action='obligations.backfill')",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        ("deferred".into(), "e2,e3".into(), r#"{"count":1}"#.into())
+    );
+}

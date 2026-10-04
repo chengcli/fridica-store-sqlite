@@ -61,6 +61,9 @@ impl LedgerLookups for Sqlite<'_> {
     fn attachment_context(&mut self, key: &str) -> Result<Option<String>> {
         Ok(self.0.query_row("SELECT json_extract(payload_json,'$.context') FROM replay_events WHERE kind='parent_attachment_result' AND complete=1 AND json_extract(payload_json,'$.key')=? ORDER BY seq DESC LIMIT 1",[key],|r|r.get::<_,String>(0)).optional()?)
     }
+    fn backfill_record(&mut self, client_id: &str) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT payload_json FROM replay_events WHERE kind='obligations_backfill' AND json_extract(payload_json,'$.request.client_id')=?",[client_id],|r|r.get(0)).optional()?)
+    }
 }
 
 impl FeedLookups for Sqlite<'_> {
