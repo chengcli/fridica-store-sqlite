@@ -51,7 +51,17 @@ pub fn enqueue_tx(c: &Connection, item: &Post, now: f64) -> Result<i64> {
     }
     if !matches!(
         item.kind.as_str(),
-        "reply" | "notice" | "report" | "debrief_root" | "upload" | "approval_notice"
+        "reply"
+            | "notice"
+            | "report"
+            | "debrief_root"
+            | "upload"
+            | "approval_notice"
+            // An external driver's posts (fridica#130).
+            | "study_claim"
+            | "study_result"
+            | "study_root"
+            | "driver_report"
     ) {
         bail!("unknown outbox kind");
     }

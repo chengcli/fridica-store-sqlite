@@ -10,9 +10,9 @@ use fridica_core::store::{
 use rusqlite::{params, Connection, OptionalExtension, Params, Row};
 use serde_json::json;
 
-const THREAD:&str="SELECT id,workspace,channel,root_ts,status,control,pause_reason,turns,wait_streak,no_progress,last_reply_hash,reset_at,summary,decisions_json,context_json,debriefed_turn,last_unsolicited,created,updated,version,control_json,throttled_until FROM threads";
+const THREAD:&str="SELECT id,workspace,channel,root_ts,status,control,pause_reason,turns,wait_streak,no_progress,last_reply_hash,reset_at,summary,decisions_json,context_json,debriefed_turn,last_unsolicited,created,updated,version,control_json,throttled_until,driver FROM threads";
 const WORKER:&str="SELECT id,session_id,machine,workspace,backend,role,ephemeral,backend_session_id,status,summary,last_result_json,slot,created,updated FROM workers";
-const JOB:&str="SELECT id,worker_id,session_id,brief,join_group,inbox_id,deliverable,fetch_repo,fetch_ref,status,attempt,reported,result_json,error,queued_at,started_at,finished_at,work_item_id,target_sha,target_tree FROM jobs";
+const JOB:&str="SELECT id,worker_id,session_id,brief,join_group,inbox_id,deliverable,fetch_repo,fetch_ref,status,attempt,reported,result_json,error,queued_at,started_at,finished_at,work_item_id,target_sha,target_tree,COALESCE((SELECT role FROM workers WHERE workers.id=jobs.worker_id),''),tags_json FROM jobs";
 const OUTBOX:&str="SELECT id,idem_key,session_id,kind,channel,thread_ts,text,meta_json,filename,\"after\",state,attempts,retry_at,sent_ts,error,created,blob IS NOT NULL,delivered_at,trigger_event,trigger_class,answers_json FROM outbox";
 
 fn thread(r: &Row<'_>) -> rusqlite::Result<ThreadView> {
@@ -39,6 +39,7 @@ fn thread(r: &Row<'_>) -> rusqlite::Result<ThreadView> {
         version: r.get(19)?,
         control_detail_json: r.get(20)?,
         throttled_until: r.get(21)?,
+        driver: r.get(22)?,
     })
 }
 fn worker(r: &Row<'_>) -> rusqlite::Result<WorkerView> {
@@ -81,6 +82,10 @@ fn job(r: &Row<'_>) -> rusqlite::Result<JobView> {
         work_item_id: r.get(17)?,
         target_sha: r.get(18)?,
         target_tree: r.get(19)?,
+        role: r.get(20)?,
+        tags: serde_json::from_str(&r.get::<_, String>(21)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(21, rusqlite::types::Type::Text, Box::new(e))
+        })?,
     })
 }
 fn post(r: &Row<'_>) -> rusqlite::Result<PostView> {

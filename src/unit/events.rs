@@ -3,7 +3,8 @@
 use super::Sqlite;
 use anyhow::Result;
 use fridica_core::store::{
-    FeedLookups, GithubPause, LedgerLookups, OutboxPost, RecordedNames, SlackIdentity, SlackNames,
+    FeedJob, FeedLookups, GithubPause, LedgerLookups, OutboxPost, RecordedNames, SlackIdentity,
+    SlackNames,
 };
 use rusqlite::{params, OptionalExtension};
 
@@ -84,6 +85,27 @@ impl FeedLookups for Sqlite<'_> {
             .0
             .prepare_cached("SELECT session_id FROM jobs WHERE id=?")?
             .query_row([id], |r| r.get(0))
+            .optional()?)
+    }
+    fn feed_job(&mut self, id: &str) -> Result<Option<FeedJob>> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT j.session_id,j.worker_id,COALESCE(w.role,''),j.join_group,j.attempt,j.status,j.result_json,j.error
+                FROM jobs j LEFT JOIN workers w ON w.id=j.worker_id WHERE j.id=?",
+            )?
+            .query_row([id], |r| {
+                Ok(FeedJob {
+                    session: r.get(0)?,
+                    worker: r.get(1)?,
+                    role: r.get(2)?,
+                    join_group: r.get(3)?,
+                    attempt: r.get(4)?,
+                    status: r.get(5)?,
+                    result_json: r.get(6)?,
+                    error: r.get(7)?,
+                })
+            })
             .optional()?)
     }
     fn message_received_at(&mut self, event_id: &str) -> Result<Option<f64>> {

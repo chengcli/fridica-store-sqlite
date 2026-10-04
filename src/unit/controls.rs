@@ -154,6 +154,40 @@ impl ThreadControls for Sqlite<'_> {
         }
         Ok(())
     }
+    fn thread_driver(&mut self, session: &str) -> Result<String> {
+        Ok(self
+            .0
+            .query_row("SELECT driver FROM threads WHERE id=?", [session], |r| {
+                r.get(0)
+            })?)
+    }
+    fn set_thread_driver(
+        &mut self,
+        session: &str,
+        driver: &str,
+        actor: &str,
+        now: f64,
+    ) -> Result<bool> {
+        if !matches!(driver, "parent" | "external") {
+            anyhow::bail!("unknown thread driver");
+        }
+        let current = self.thread_driver(session)?;
+        if current == driver {
+            return Ok(false);
+        }
+        self.0.execute(
+            "UPDATE threads SET driver=?,version=version+1,updated=? WHERE id=?",
+            params![driver, now, session],
+        )?;
+        self.audit_control(
+            now,
+            actor,
+            "driver",
+            session,
+            &serde_json::json!({"from":current,"to":driver}).to_string(),
+        )?;
+        Ok(true)
+    }
     fn audit_control(
         &mut self,
         now: f64,

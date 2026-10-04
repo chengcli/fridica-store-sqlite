@@ -2,7 +2,7 @@
 use anyhow::{bail, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub const VERSION: usize = 10;
+pub const VERSION: usize = 11;
 pub const MIGRATIONS: [&str; VERSION] = [
     include_str!("migrations/001.sql"),
     include_str!("migrations/002.sql"),
@@ -14,6 +14,7 @@ pub const MIGRATIONS: [&str; VERSION] = [
     include_str!("migrations/008.sql"),
     include_str!("migrations/009.sql"),
     include_str!("migrations/010.sql"),
+    include_str!("migrations/011.sql"),
 ];
 
 pub fn version(c: &Connection) -> Result<usize> {
