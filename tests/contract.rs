@@ -1166,3 +1166,625 @@ async fn linked_threads_are_read_with_their_state() {
         .unwrap();
     assert_eq!(limited.len(), 1);
 }
+
+#[tokio::test]
+async fn the_runtime_row_starts_beats_and_stops() {
+    use fridica_core::store::RuntimeStart;
+    let (_dir, store) = store().await;
+    assert_eq!(
+        store.transact(|u| u.previous_slack_status()).await.unwrap(),
+        None
+    );
+    store
+        .transact(|u| {
+            u.start_runtime(&RuntimeStart {
+                pid: 42,
+                started_at: 10.0,
+                observe_only: true,
+                config_fingerprint: "f1".into(),
+            })?;
+            u.advertise_control("/run/sock")?;
+            u.heartbeat(11.0)
+        })
+        .await
+        .unwrap();
+    let row = || {
+        store.call(|c| {
+            Ok(c.query_row(
+                "SELECT pid,started_at,heartbeat_at,slack_status,observe_only,control_socket,config_fingerprint FROM runtime WHERE id=1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)),
+            )?)
+        })
+    };
+    assert_eq!(
+        row().await.unwrap(),
+        (
+            42,
+            10.0,
+            11.0,
+            "starting".into(),
+            true,
+            "/run/sock".into(),
+            "f1".into()
+        )
+    );
+    assert_eq!(
+        store.transact(|u| u.previous_slack_status()).await.unwrap(),
+        Some("starting".into())
+    );
+    store.transact(|u| u.stop_runtime(12.0)).await.unwrap();
+    // A restart clears the advertised endpoint.
+    store
+        .transact(|u| {
+            u.start_runtime(&RuntimeStart {
+                pid: 43,
+                started_at: 20.0,
+                observe_only: false,
+                config_fingerprint: "f2".into(),
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        row().await.unwrap(),
+        (
+            43,
+            20.0,
+            20.0,
+            "starting".into(),
+            false,
+            String::new(),
+            "f2".into()
+        )
+    );
+}
+
+async fn neighbour_thread(store: &Store) {
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,status,control,turns,version,debriefed_turn,decisions_json,created,updated) VALUES
+                    ('T:C:1','T','C','1','complete','active',3,7,1,'[\"a\"]',1,1);
+                 INSERT INTO messages(event_id,workspace,channel,ts,root_ts,sender,text,source,received_at,meta_json) VALUES
+                    ('e1','T','C','1','1','U1','root','socket',1,NULL),
+                    ('e2','T','C','2','1','U2','peer','socket',2,'{}'),
+                    ('e3','T','D','3','3','U3','other','socket',3,NULL);
+                 INSERT INTO thread_inbox(id,session_id,kind,ref,payload_json,state,created,not_before) VALUES
+                    (1,'T:C:1','message','e1','{}','done',1,0),
+                    (2,'T:C:1','worker_result','J1','{}','processing',2,0),
+                    (3,'T:C:1','message','e2','{}','pending',3,5);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn thread_memory_keeps_decisions_and_parent_notes() {
+    let (_dir, store) = store().await;
+    neighbour_thread(&store).await;
+    let (notes, decisions) = store
+        .transact(|u| {
+            let before = u.latest_notes("T:C:1")?;
+            assert_eq!(before, None);
+            u.keep_decisions("T:C:1", r#"["a","b"]"#)?;
+            u.write_parent_notes("T:C:1", 1, r#"{"repo":"x"}"#, 2, 9.0)?;
+            u.write_parent_notes("T:C:1", 2, r#"{"z":1,"a":2}"#, 3, 10.0)?;
+            Ok((u.latest_notes("T:C:1")?, u.thread_decisions("T:C:1")?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(notes, Some((2, r#"{"z":1,"a":2}"#.into())));
+    assert_eq!(decisions, r#"["a","b"]"#);
+    assert!(store
+        .transact(|u| u.thread_decisions("T:C:9"))
+        .await
+        .is_err());
+    let audit: Vec<(String, String, String)> = store
+        .call(|c| {
+            Ok(
+                c.prepare("SELECT actor,action,details_json FROM audit ORDER BY id")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 2);
+    assert_eq!(
+        (audit[0].0.as_str(), audit[0].1.as_str()),
+        ("parent", "notes.write")
+    );
+    let details: serde_json::Value = serde_json::from_str(&audit[1].2).unwrap();
+    assert_eq!(details, serde_json::json!({"revision":2,"inbox_id":3}));
+    let source: String = store
+        .call(|c| {
+            Ok(
+                c.query_row("SELECT source FROM notes WHERE revision=2", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(source, "3");
+    store
+        .call(|c| {
+            c.execute("INSERT INTO outbox(idem_key,session_id,kind,channel,created) VALUES('2:reply','T:C:1','reply','C',1)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let queued = store
+        .transact(|u| {
+            Ok((
+                u.post_queued("T:C:1", "2:reply")?,
+                u.post_queued("T:C:1", "3:reply")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued, (true, false));
+}
+
+#[tokio::test]
+async fn result_snapshots_follow_jobs_and_their_files() {
+    use fridica_core::store::InboxEntry;
+    let (_dir, store) = store().await;
+    neighbour_thread(&store).await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO workers(id,session_id,machine,workspace,backend,role,created,updated) VALUES
+                    ('W1','T:C:1','m','/w','claude','coder',1,1);
+                 INSERT INTO jobs(id,worker_id,session_id,inbox_id,join_group,brief,deliverable,status,queued_at,result_json,retry_at) VALUES
+                    ('J1','W1','T:C:1',1,'g','one','markdown','done',1,'{\"status\":\"done\"}',NULL),
+                    ('J2','W1','T:C:1',NULL,'g','two','report','queued',2,NULL,99.5),
+                    ('J3','W1','T:C:1',2,'','three','figures_pdf','done',3,NULL,NULL);
+                 INSERT INTO artifacts(id,job_id,session_id,machine,path,kind,blob,status) VALUES
+                    ('A2','J1','T:C:1','m','/out/b.md','file',X'02','ready'),
+                    ('A1','J1','T:C:1','m','/out/a.md','file',X'01','ready'),
+                    ('A3','J1','T:C:1','m','/out/c.md','file',NULL,'ready'),
+                    ('A4','J2','T:C:1','m','/out/d.md','file',X'04','ready'),
+                    ('A5','J3','T:C:1','m','/out/e.pdf','file',X'05','ready');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (groups, results, single) = store
+        .transact(|u| {
+            Ok((
+                (u.job_group("J1", "T:C:1")?, u.job_group("J1", "T:C:2")?),
+                u.group_results("T:C:1", "g", "J1")?,
+                u.group_results("T:C:1", "", "J3")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(groups, (Some("g".into()), None));
+    assert_eq!(results.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+    assert_eq!(
+        (&first["id"], &first["role"], &first["result"]["status"]),
+        (&"J1".into(), &"coder".into(), &"done".into())
+    );
+    let second: serde_json::Value = serde_json::from_str(&results[1]).unwrap();
+    assert_eq!(second["rate_limit_resets_at"], 99.5);
+    assert!(first.get("rate_limit_resets_at").is_none());
+    assert_eq!(single.len(), 1);
+    let (entry, origin, inboxes) = store
+        .transact(|u| {
+            Ok((
+                (u.inbox_entry(2, "T:C:1")?, u.inbox_entry(2, "T:C:2")?),
+                (
+                    u.message_origin("e1")?,
+                    u.message_origin("e2")?,
+                    u.message_origin("e9")?,
+                ),
+                (
+                    u.job_inbox("J1", "T:C:1")?,
+                    u.job_inbox("J2", "T:C:1")?,
+                    u.job_inbox("J9", "T:C:1")?,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        entry,
+        (
+            Some(InboxEntry {
+                kind: "worker_result".into(),
+                reference: "J1".into(),
+                payload: "{}".into()
+            }),
+            None
+        )
+    );
+    assert_eq!(
+        origin,
+        (Some(("e1".into(), false)), Some(("e2".into(), true)), None)
+    );
+    assert_eq!(inboxes, (Some(1), None, None));
+    // Only file deliverables' ready files, job by job in the order given.
+    let files = store
+        .transact(|u| {
+            u.deliverable_files(
+                "T:C:1",
+                &[
+                    Some("J3".into()),
+                    None,
+                    Some("J2".into()),
+                    Some("J1".into()),
+                ],
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        files,
+        vec![
+            ("/out/e.pdf".into(), vec![5]),
+            ("/out/a.md".into(), vec![1]),
+            ("/out/b.md".into(), vec![2]),
+        ]
+    );
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO obligations(id,session_id,kind,dedup_key,source_json,created,due,updated) VALUES
+                    ('O1','T:C:1','mention','k1','{}',1,5,1),('O2','T:C:1','ask','k2','{}',1,5,1);
+                 INSERT INTO outbox(id,idem_key,session_id,kind,channel,created) VALUES(7,'2:upload:0','T:C:1','upload','C',1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .transact(|u| u.link_answers(7, &["O1".into(), "O2".into()]))
+        .await
+        .unwrap();
+    let links: i64 = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM obligation_posts WHERE outbox_id=7",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(links, 2);
+}
+
+#[tokio::test]
+async fn reply_evidence_reads_the_last_reply_and_the_thread() {
+    use fridica_core::store::LastReply;
+    let (_dir, store) = store().await;
+    neighbour_thread(&store).await;
+    assert_eq!(
+        store.transact(|u| u.last_reply("T:C:1")).await.unwrap(),
+        None
+    );
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO outbox(id,idem_key,session_id,kind,channel,state,created) VALUES
+                    (1,'1:reply','T:C:1','reply','C','sent',1),
+                    (2,'x','T:C:1','notice','C','pending',2);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (last, messages, senders) = store
+        .transact(|u| {
+            Ok((
+                u.last_reply("T:C:1")?,
+                u.latest_messages("T:C:1")?,
+                (
+                    u.message_sender("e2", "T:C:1")?,
+                    u.message_sender("e3", "T:C:1")?,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    // The reply answered inbox item 1, message e1.
+    assert_eq!(
+        last,
+        Some(LastReply {
+            id: 1,
+            state: "sent".into(),
+            requester: "U1".into()
+        })
+    );
+    assert_eq!(
+        messages,
+        vec![("U2".into(), "peer".into()), ("U1".into(), "root".into())]
+    );
+    assert_eq!(senders, (Some("U2".into()), None));
+}
+
+#[tokio::test]
+async fn debriefs_queue_post_and_settle() {
+    use fridica_core::store::{DebriefOrigin, DebriefPost, DebriefTurn};
+    let (_dir, store) = store().await;
+    neighbour_thread(&store).await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO outbox(id,idem_key,session_id,kind,channel,trigger_class,created) VALUES
+                    (1,'1:reply','T:C:1','reply','C','peer',1),
+                    (2,'2:debrief','T:C:1','debrief_root','C','legacy',2);
+                 INSERT INTO reply_reservations(id,session_id,inbox_id,trigger_class,reserved_at) VALUES
+                    ('r2','T:C:1',2,'peer',1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let origin = store
+        .transact(|u| {
+            let none = u.debrief_origin("T:C:1", "9:reply")?;
+            assert_eq!(none, None);
+            let origin = u.debrief_origin("T:C:1", "1:reply")?;
+            u.queue_debrief("T:C:1", 1, r#"{"z":1,"a":2}"#, 4.0)?;
+            Ok(origin)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        origin,
+        Some(DebriefOrigin {
+            version: 7,
+            turn: 3,
+            class: "peer".into()
+        })
+    );
+    let queued: (String, String, String) = store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT kind,ref,payload_json FROM thread_inbox WHERE id=4",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        queued,
+        ("debrief".into(), "1".into(), r#"{"z":1,"a":2}"#.into())
+    );
+    let due = store
+        .transact(|u| {
+            Ok((
+                u.debrief_due("T:C:1", Some(7), 3, 2)?,
+                u.debrief_due("T:C:1", Some(6), 3, 2)?,
+                u.debrief_due("T:C:1", Some(7), 1, 2)?,
+                u.debrief_due("T:C:1", Some(7), 3, 3)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(due, (true, false, false, false));
+    // As stored: an unknown version compares as NULL, which is an error.
+    assert!(store
+        .transact(|u| u.debrief_due("T:C:1", None, 3, 2))
+        .await
+        .is_err());
+    assert!(store
+        .transact(|u| u.debrief_due("T:C:9", Some(7), 3, 2))
+        .await
+        .is_err());
+    let state = || {
+        store.call(|c| {
+            Ok(c.query_row(
+                "SELECT i.state,r.state,r.outbox_id FROM thread_inbox i JOIN reply_reservations r ON r.inbox_id=i.id WHERE i.id=2",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)),
+            )?)
+        })
+    };
+    store
+        .transact(|u| {
+            u.debrief_stale(2)?;
+            // Only an item being processed returns to pending.
+            u.debrief_stale(1)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        state().await.unwrap(),
+        ("pending".into(), "released".into(), None)
+    );
+    store
+        .call(|c| {
+            c.execute_batch("UPDATE thread_inbox SET state='processing' WHERE id=2; UPDATE reply_reservations SET state='reserved' WHERE id='r2';")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .transact(|u| {
+            u.debrief_posted(&DebriefPost {
+                session: "T:C:1".into(),
+                inbox: 2,
+                post: 2,
+                class: "peer".into(),
+                turn: 3,
+                now: 8.0,
+            })?;
+            u.keep_debrief_turn(&DebriefTurn {
+                session: "T:C:1".into(),
+                inbox: 2,
+                action: r#"{"debrief":"done"}"#.into(),
+                response: "null".into(),
+                context: r#"{"b":1,"a":2}"#.into(),
+                created: 8.0,
+            })?;
+            u.inbox_done(2)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        state().await.unwrap(),
+        ("done".into(), "reserved".into(), Some(2))
+    );
+    let (thread, class, turn): ((i64, f64, i64), String, (String, String, String)) = store
+        .call(|c| {
+            Ok((
+                c.query_row(
+                    "SELECT debriefed_turn,updated,version FROM threads WHERE id='T:C:1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?,
+                c.query_row("SELECT trigger_class FROM outbox WHERE id=2", [], |r| {
+                    r.get(0)
+                })?,
+                c.query_row(
+                    "SELECT call,backend,context_json FROM parent_turns WHERE inbox_id=2",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(thread, (3, 8.0, 8));
+    assert_eq!(class, "peer");
+    assert_eq!(
+        turn,
+        (
+            "debrief".into(),
+            "adapter".into(),
+            r#"{"b":1,"a":2}"#.into()
+        )
+    );
+    store
+        .call(|c| {
+            c.execute(
+                "UPDATE reply_reservations SET outbox_id=NULL WHERE id='r2'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .transact(|u| u.debrief_unavailable("T:C:1", 2, 9.0))
+        .await
+        .unwrap();
+    let (reservation, audit): (String, (String, String, String)) = store
+        .call(|c| {
+            Ok((
+                c.query_row(
+                    "SELECT state FROM reply_reservations WHERE id='r2'",
+                    [],
+                    |r| r.get(0),
+                )?,
+                c.query_row("SELECT actor,action,details_json FROM audit", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(reservation, "released");
+    assert_eq!(
+        audit,
+        (
+            "system".into(),
+            "debrief.unavailable".into(),
+            r#"{"inbox_id":2}"#.into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn thread_turns_schedule_and_read_progress() {
+    use fridica_core::store::{ProgressNote, ProgressState};
+    let (_dir, store) = store().await;
+    neighbour_thread(&store).await;
+    store
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO threads(id,workspace,channel,root_ts,created,updated) VALUES('T:C:2','T','C','2',1,1);
+                 INSERT INTO thread_inbox(id,session_id,kind,state,created,not_before) VALUES
+                    (10,'T:C:2','message','pending',1,0),(11,'T:C:1','message','pending',1,0);
+                 INSERT INTO workers(id,session_id,machine,workspace,backend,created,updated) VALUES
+                    ('W1','T:C:1','m','/w','claude',1,1);
+                 INSERT INTO jobs(id,worker_id,session_id,brief,status,attempt,queued_at) VALUES
+                    ('J1','W1','T:C:1','one','running',2,1),('J2','W1','T:C:1','two','done',1,1);
+                 INSERT INTO job_progress(job_id,attempt,seq,text,created) VALUES
+                    ('J1',2,1,'halfway',1),('J1',1,1,'old',1),('J2',1,1,'late',1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let ready = store
+        .transact(|u| {
+            Ok((
+                u.ready_threads(4.0, 10)?,
+                u.ready_threads(5.0, 10)?,
+                u.ready_threads(5.0, 1)?,
+            ))
+        })
+        .await
+        .unwrap();
+    // Item 3 of T:C:1 waits until 5; T:C:2's item 10 is older than 11.
+    assert_eq!(
+        ready,
+        (
+            vec!["T:C:2".to_owned(), "T:C:1".to_owned()],
+            vec!["T:C:1".to_owned(), "T:C:2".to_owned()],
+            vec!["T:C:1".to_owned()],
+        )
+    );
+    let progress = store
+        .transact(|u| {
+            Ok((
+                u.progress_state(2, "T:C:1")?,
+                u.progress_state(3, "T:C:1")?,
+                u.running_progress_note("J1", 2, 1, "T:C:1")?,
+                u.running_progress_note("J1", 1, 1, "T:C:1")?,
+                u.running_progress_note("J2", 1, 1, "T:C:1")?,
+                u.running_progress_note("J1", 2, 1, "T:C:2")?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        progress,
+        (
+            ProgressState {
+                processing: true,
+                active: true
+            },
+            ProgressState {
+                processing: false,
+                active: true
+            },
+            Some(ProgressNote {
+                text: "halfway".into(),
+                worker: "W1".into()
+            }),
+            None,
+            None,
+            None,
+        )
+    );
+    assert!(store
+        .transact(|u| u.progress_state(2, "T:C:9"))
+        .await
+        .is_err());
+    store.transact(|u| u.inbox_done(3)).await.unwrap();
+    assert_eq!(
+        store.transact(|u| u.ready_threads(5.0, 10)).await.unwrap(),
+        vec!["T:C:2".to_owned(), "T:C:1".to_owned()]
+    );
+}

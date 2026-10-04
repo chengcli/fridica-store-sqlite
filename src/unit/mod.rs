@@ -9,6 +9,7 @@ mod controls;
 mod events;
 mod ingest;
 mod ledger;
+mod neighbours;
 mod views;
 
 /// The area traits over one connection or transaction. While Fridica still
