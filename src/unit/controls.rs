@@ -70,6 +70,34 @@ impl ThreadControls for Sqlite<'_> {
         )?;
         Ok(())
     }
+    fn retry_failed_turn(&mut self, session: &str) -> Result<Option<i64>> {
+        let last: Option<(i64, String)> = self
+            .0
+            .query_row(
+                "SELECT inbox_id,error FROM parent_turns WHERE session_id=? AND call IN ('decide','repair') AND error!='parent_rate_limited' ORDER BY id DESC LIMIT 1",
+                [session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((inbox, error)) = last else {
+            return Ok(None);
+        };
+        if !matches!(
+            error.as_str(),
+            "parent_unavailable" | "parent_invalid_after_repair"
+        ) {
+            return Ok(None);
+        }
+        let requeued = self.0.execute(
+            "UPDATE thread_inbox SET state='pending',attempts=0,not_before=0 WHERE id=? AND session_id=? AND state='done'",
+            params![inbox, session],
+        )?;
+        if requeued == 0 {
+            return Ok(None);
+        }
+        self.unblock(session)?;
+        Ok(Some(inbox))
+    }
     fn release_worker_results(&mut self, session: &str) -> Result<()> {
         self.0.execute("UPDATE thread_inbox SET not_before=0 WHERE session_id=? AND kind IN ('worker_result','worker_interrupted') AND state='pending'",[session])?;
         Ok(())
