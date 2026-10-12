@@ -1,6 +1,6 @@
 [package]
 name = "fridica-store-sqlite"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Fridica's state on SQLite: the store thread, schema and migrations, weekly archives and the replay ledger"
