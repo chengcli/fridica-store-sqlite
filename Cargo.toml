@@ -41,7 +41,3 @@ required-features = ["testing"]
 fridica-core = { version = "0.6.0", features = ["conformance"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-
-# Use the coordinated core release until it is published.
-[patch.crates-io]
-fridica-core = { path = "../fridica-core" }

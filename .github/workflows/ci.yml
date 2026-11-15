@@ -17,13 +17,4 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
-      # Publishing verifies against crates.io and ignores [patch]; while
-      # fridica-core is pinned by git (fridica#117) the dry run waits.
-      - name: cargo publish --dry-run
-        shell: bash
-        run: |
-          if grep -q '^\[patch' Cargo.toml; then
-            echo "skipped while fridica-core is patched"
-          else
-            cargo publish --dry-run --locked
-          fi
+      - run: cargo publish --dry-run --locked
